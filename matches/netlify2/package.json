@@ -1,0 +1,12 @@
+{
+  "name": "football-matches-app",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "netlify dev",
+    "build": "echo \"no build step\""
+  },
+  "dependencies": {
+    "@netlify/blobs": "^7.0.0"
+  }
+}

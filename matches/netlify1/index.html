@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Футбольні матчі</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f5f5f5; padding: 1rem; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+    th, td { padding: 0.5rem; border: 1px solid #ccc; text-align: left; }
+    tr.seen { background-color: var(--seen-color, #ffe4e1); }
+    tr:hover { background: #eef; }
+    select { margin-bottom: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Топ футбольних матчів 2000–2025</h1>
+  <label for="colorSelector">Колір переглянутого рядка:</label>
+  <select id="colorSelector">
+    <option value="#ffe4e1">Світло рожевий</option>
+    <option value="#e6ffe6">Світло зелений</option>
+    <option value="#ffffcc">Світло жовтий</option>
+    <option value="#e0ffff">Блакитний</option>
+  </select>
+  <table id="matchesTable">
+    <thead>
+      <tr>
+        <th data-sort="id">№</th>
+        <th data-sort="teams">Матч</th>
+        <th data-sort="tournament">Турнір</th>
+        <th data-sort="date">Дата</th>
+        <th data-sort="seen">Переглянуто</th>
+      </tr>
+    </thead>
+    <tbody id="matchesBody"></tbody>
+  </table>
+
+<script>
+  const FUNCTION_URL_LOAD = '/.netlify/functions/load';
+  const FUNCTION_URL_SAVE = '/.netlify/functions/save';
+  const colorSelector = document.getElementById('colorSelector');
+  const tbody = document.getElementById('matchesBody');
+
+  const matches = [
+    { id:1, teams:"Tottenham vs Manchester United", tournament:"Europa League Final", date:"2025-05-21" },
+    { id:2, teams:"Crystal Palace vs Manchester City", tournament:"FA Cup Final", date:"2025-05-17" },
+    { id:3, teams:"Barcelona vs Real Madrid", tournament:"Copa del Rey Final", date:"2025-04-26" },
+    { id:4, teams:"Newcastle vs Liverpool", tournament:"EFL Cup Final", date:"2025-03-16" },
+    { id:5, teams:"Spain vs Netherlands", tournament:"Nations League QF (2й матч)", date:"2025-03-24" },
+    { id:6, teams:"Italy vs Germany", tournament:"Nations League QF (1й матч)", date:"2025-03-21" },
+    { id:7, teams:"Bodø/Glimt vs Lazio", tournament:"Europa League QF (2й матч)", date:"2025-04-17" },
+    { id:8, teams:"Liverpool vs Manchester United", tournament:"Premier League", date:"2025-01-05" },
+    { id:9, teams:"Liverpool vs Southampton", tournament:"Premier League", date:"2025-03-08" },
+    { id:10, teams:"Nottingham Forest vs Manchester City", tournament:"Premier League", date:"2025-03-08" },
+    { id:11, teams:"Bayern Munich vs Wolfsburg", tournament:"Bundesliga", date:"2015-09-22" },
+    { id:12, teams:"Manchester City vs Queens Park Rangers", tournament:"Premier League Final Day", date:"2012-05-13" },
+    { id:13, teams:"Liverpool vs Barcelona", tournament:"Champions League SF (2‑й матч)", date:"2019-05-07" },
+    { id:14, teams:"Manchester United vs Arsenal", tournament:"Premier League", date:"2011-08-28" },
+    { id:15, teams:"Chelsea vs Barcelona", tournament:"Champions League SF", date:"2012-04-24" },
+    { id:16, teams:"Brazil vs Germany", tournament:"World Cup Semi‑Final", date:"2014-07-08" },
+    { id:17, teams:"Barcelona vs Real Madrid", tournament:"La Liga", date:"2010-11-29" },
+    { id:18, teams:"Borussia Dortmund vs Schalke", tournament:"Bundesliga Derby", date:"2017-01-01" },
+    { id:19, teams:"Barcelona vs Inter Milan", tournament:"Champions League SF", date:"2010-04-28" },
+    { id:20, teams:"Chelsea vs Bayern Munich", tournament:"Champions League Final", date:"2012-05-19" },
+    { id:21, teams:"Argentina vs France", tournament:"World Cup Final", date:"2022-12-18" },
+    { id:22, teams:"AC Milan vs Liverpool", tournament:"Champions League Final", date:"2007-05-23" },
+    { id:23, teams:"Barcelona vs PSG", tournament:"Champions League R16", date:"2017-03-08" },
+    { id:24, teams:"Tottenham vs Ajax", tournament:"Champions League SF", date:"2019-05-08" },
+    { id:25, teams:"Real Madrid vs Atlético Madrid", tournament:"Champions League Final", date:"2014-05-24" }
+  ];
+
+  let state = { seen: {}, selectedColor: colorSelector.value };
+
+  async function loadState() {
+    try {
+      const res = await fetch(FUNCTION_URL_LOAD);
+      const tmp = await res.json();
+      if (tmp && tmp.seen) { state = tmp; colorSelector.value = state.selectedColor; }
+    } catch(e){ console.error('Load state error', e); }
+  }
+
+  async function saveState() {
+    try {
+      await fetch(FUNCTION_URL_SAVE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(state)
+      });
+    } catch(e){ console.error('Save state error', e); }
+  }
+
+  function render() {
+    tbody.innerHTML = '';
+    matches.forEach(m => {
+      const tr = document.createElement('tr');
+      if (state.seen[m.id]) {
+        tr.classList.add('seen');
+        tr.style.setProperty('--seen-color', state.selectedColor);
+      }
+      tr.innerHTML = `
+        <td>${m.id}</td>
+        <td>${m.teams}</td>
+        <td>${m.tournament}</td>
+        <td>${m.date}</td>
+        <td><input type="checkbox" data-id="${m.id}" ${state.seen[m.id] ? 'checked' : ''}></td>
+      `;
+      tbody.appendChild(tr);
+    });
+    tbody.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+      cb.addEventListener('change', () => {
+        state.seen[cb.dataset.id] = cb.checked;
+        saveState().then(render);
+      });
+    });
+  }
+
+  colorSelector.addEventListener('change', () => {
+    state.selectedColor = colorSelector.value;
+    saveState().then(render);
+  });
+
+  (async () => {
+    await loadState();
+    render();
+  })();
+</script>
+</body>
+</html>

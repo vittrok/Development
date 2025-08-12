@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Admin — завантажити матчі</title>
+  <style>
+    body{font-family:Arial;padding:18px;background:#fafbff}
+    textarea{width:100%;height:260px;padding:8px;font-family:monospace}
+    input,button{padding:8px;margin-top:8px}
+    .row{margin-bottom:12px}
+  </style>
+</head>
+<body>
+  <h1>Admin — завантажити / оновити matches.json</h1>
+  <p>Вставте JSON (масив об'єктів): кожен об'єкт повинен мати принаймні: <code>id, match, tournament, date, link</code>.</p>
+
+  <div class="row">
+    <label>Admin secret (якщо встановлено в Netlify):</label><br />
+    <input id="adminSecret" placeholder="(залишити пустим якщо не задано)" />
+  </div>
+
+  <div class="row">
+    <label>Вставити JSON:</label>
+    <textarea id="jsonArea">[{"id":1,"match":"Team A vs Team B","tournament":"Example","date":"2025-05-01","link":""}]</textarea>
+  </div>
+
+  <div class="row">
+    <label>Або файл .json:</label><br/>
+    <input type="file" id="fileInput" accept=".json" />
+  </div>
+
+  <div class="row">
+    <button id="uploadBtn">Завантажити</button>
+    <button id="previewBtn">Попередній перегляд (console)</button>
+  </div>
+
+  <div id="result" style="margin-top:12px;color:#333"></div>
+
+<script>
+const API_SAVE_MATCHES = '/.netlify/functions/saveMatches';
+const area = document.getElementById('jsonArea');
+const fileInput = document.getElementById('fileInput');
+const result = document.getElementById('result');
+const adminSecretInput = document.getElementById('adminSecret');
+
+fileInput.addEventListener('change', () => {
+  const f = fileInput.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = e => { area.value = e.target.result; };
+  reader.readAsText(f);
+});
+
+document.getElementById('previewBtn').addEventListener('click', () => {
+  try { console.log(JSON.parse(area.value)); alert('Перевірка пройшла — дивись console.'); }
+  catch(e){ alert('JSON некоректний: ' + e.message); }
+});
+
+document.getElementById('uploadBtn').addEventListener('click', async () => {
+  result.textContent = 'Завантаження…';
+  let payload;
+  try { payload = JSON.parse(area.value); }
+  catch(e){ result.textContent = 'Помилка: JSON некоректний — ' + e.message; return; }
+  if (!Array.isArray(payload)) { result.textContent = 'Помилка: очікується масив об\'єктів.'; return; }
+
+  try {
+    const headers = {'Content-Type':'application/json'};
+    const secret = adminSecretInput.value.trim();
+    if (secret) headers['x-admin-secret'] = secret;
+    const r = await fetch(API_SAVE_MATCHES, { method:'POST', headers, body: JSON.stringify(payload) });
+    const json = await r.json();
+    if (!r.ok) throw new Error(JSON.stringify(json));
+    result.textContent = 'ОК — matches оновлено на сервері.';
+  } catch (err) {
+    result.textContent = 'Помилка при збереженні: ' + (err.message || err);
+    console.error(err);
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Топ матчі — перегляд</title>
+  <style>
+    :root { --seen-color: #ffe4e1; }
+    body { font-family: Arial, sans-serif; background:#f6f7fb; margin:0; padding:18px; color:#222; }
+    h1 { margin:0 0 12px 0; font-size:20px; }
+    .controls { display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+    .controls label { font-weight:600; }
+    select, button, input[type="search"] { padding:6px 8px; font-size:14px; }
+    table { width:100%; border-collapse:collapse; background:white; box-shadow:0 0 0 1px #e0e0e0; }
+    th, td { padding:10px 8px; border-bottom:1px solid #eee; text-align:left; }
+    th { background:#f1f5f9; cursor:pointer; user-select:none; }
+    th.sort-asc::after { content:" ↑"; font-weight:600; }
+    th.sort-desc::after { content:" ↓"; font-weight:600; }
+    tr.seen { background-color: var(--seen-color); }
+    a.link { color:#0a58ca; text-decoration:none; }
+    .small { font-size:13px; color:#666; }
+    .status { margin-left:auto; font-size:13px; color:#666; }
+    .note { margin-top:10px; font-size:13px; color:#666; }
+  </style>
+</head>
+<body>
+  <h1>Топ матчі — перегляд</h1>
+
+  <div class="controls">
+    <label for="colorSelect">Колір переглянутого:</label>
+    <select id="colorSelect" title="Колір фон у рядку, коли позначено як переглянуто"></select>
+
+    <label for="searchBox">Пошук:</label>
+    <input id="searchBox" type="search" placeholder="пошук по команді або турніру" />
+
+    <button id="refreshBtn">Оновити з сервера</button>
+
+    <div class="status" id="status">завантаження…</div>
+  </div>
+
+  <table id="matchesTable" aria-label="Таблиця матчів">
+    <thead>
+      <tr>
+        <th data-sort="id">№</th>
+        <th data-sort="match">Матч</th>
+        <th data-sort="tournament">Турнір</th>
+        <th data-sort="date">Дата</th>
+        <th data-sort="link">Лінк</th>
+        <th data-sort="seen">Переглянуто</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <p class="note">Примітка: зміни зберігаються і синхронізуються між пристроями через Netlify Blobs.</p>
+
+<script>
+/* ========== Конфіг ========== */
+const API_GET_MATCHES = '/.netlify/functions/getMatches';
+const API_SAVE_MATCHES = '/.netlify/functions/saveMatches'; // (для адмінки)
+const API_LOAD_STATE = '/.netlify/functions/loadState';
+const API_SAVE_STATE = '/.netlify/functions/saveState';
+const FALLBACK_STATIC = '/matches.json'; // якщо blob пустий — клієнт може підвантажити цей статичний файл (опціонально)
+const COLORS = [
+  "#ffe4e1","#ffe6cc","#fff2cc","#ffffcc","#e6ffe6","#d3ffce","#e0ffff","#e6f0ff",
+  "#e6e6fa","#f5f5dc","#fff0f5","#f0fff0","#f0ffff","#fff5ee","#fbeff2","#f4f4f4"
+];
+/* =========================== */
+
+let matches = [];      // масив матчів (з blob або static)
+let state = { seen: {}, selectedColor: COLORS[0], sortBy: 'id', sortDir: 'asc' };
+const tbody = document.getElementById('tbody');
+const statusEl = document.getElementById('status');
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+/* === UI: кольори === */
+const colorSelect = document.getElementById('colorSelect');
+COLORS.forEach(c => {
+  const opt = document.createElement('option');
+  opt.value = c; opt.textContent = c;
+  colorSelect.appendChild(opt);
+});
+colorSelect.addEventListener('change', async () => {
+  state.selectedColor = colorSelect.value;
+  document.documentElement.style.setProperty('--seen-color', state.selectedColor);
+  await saveState();
+  renderTable();
+});
+
+/* === Пошук та оновлення === */
+const searchBox = document.getElementById('searchBox');
+searchBox.addEventListener('input', () => renderTable());
+document.getElementById('refreshBtn').addEventListener('click', () => init(true));
+
+/* ===== Виклики API (функції) ===== */
+async function fetchMatchesFromServer() {
+  try {
+    const r = await fetch(API_GET_MATCHES);
+    if (!r.ok) throw new Error('getMatches failed: ' + r.status);
+    const data = await r.json();
+    if (Array.isArray(data) && data.length) return data;
+    // пусто — подивимось на статичний файл
+    try {
+      const r2 = await fetch(FALLBACK_STATIC);
+      if (r2.ok) {
+        const d = await r2.json();
+        return d;
+      }
+    } catch (e) { /* ignore */ }
+    return [];
+  } catch (err) {
+    console.error(err);
+    return [];
+  }
+}
+
+async function loadState() {
+  try {
+    const r = await fetch(API_LOAD_STATE);
+    if (r.ok) {
+      const data = await r.json();
+      if (data && typeof data === 'object') {
+        // очікуємо об'єкт { seen:{}, selectedColor, sortBy, sortDir }
+        state = Object.assign({}, state, data);
+      }
+    }
+  } catch (err) {
+    console.warn('loadState error', err);
+  }
+}
+
+async function saveState() {
+  try {
+    await fetch(API_SAVE_STATE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(state)
+    });
+  } catch (err) {
+    console.warn('saveState error', err);
+  }
+}
+
+/* ===== Рендер таблиці та сортування ===== */
+function compareValues(a, b, key) {
+  const va = a[key] ?? '';
+  const vb = b[key] ?? '';
+  if (key === 'id') return Number(va) - Number(vb);
+  if (key === 'date') return new Date(va) - new Date(vb);
+  // string compare
+  return String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function renderTable() {
+  // filter by search
+  const q = searchBox.value.trim().toLowerCase();
+  let list = matches.slice();
+  if (q) {
+    list = list.filter(m => {
+      const s = `${m.match || m.teams || ''} ${m.tournament || ''} ${m.date || ''}`.toLowerCase();
+      return s.includes(q);
+    });
+  }
+
+  // sort
+  if (state.sortBy) {
+    list.sort((a,b) => {
+      const cmp = compareValues(a,b,state.sortBy);
+      return state.sortDir === 'asc' ? cmp : -cmp;
+    });
+  }
+
+  // render rows
+  tbody.innerHTML = '';
+  list.forEach((m, idx) => {
+    const tr = document.createElement('tr');
+    const id = m.id ?? idx+1;
+    if (state.seen && state.seen[id]) {
+      tr.classList.add('seen');
+      tr.style.setProperty('--seen-color', state.selectedColor);
+    }
+    tr.innerHTML = `
+      <td>${id}</td>
+      <td>${escapeHtml(m.match ?? m.teams ?? '')}</td>
+      <td class="small">${escapeHtml(m.tournament ?? '')}</td>
+      <td class="small">${escapeHtml(m.date ?? '')}</td>
+      <td>${m.link ? `<a class="link" href="${escapeAttr(m.link)}" target="_blank" rel="noopener noreferrer">переглянути</a>` : '<span class="small">немає</span>'}</td>
+      <td><input type="checkbox" data-id="${id}" ${state.seen && state.seen[id] ? 'checked' : ''}></td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  // bind checkbox listeners
+  tbody.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener('change', async (e) => {
+      const id = e.target.dataset.id;
+      if (!state.seen) state.seen = {};
+      state.seen[id] = e.target.checked;
+      await saveState();
+      renderTable(); // re-render to apply visual class
+    });
+  });
+}
+
+/* ===== Helpers для безпечного виводу ===== */
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function escapeAttr(s) {
+  return String(s).replace(/"/g,'&quot;').replace(/'/g,"&#39;");
+}
+
+/* ===== Заголовки таблиці (сортування) ===== */
+document.querySelectorAll('th[data-sort]').forEach(th => {
+  th.addEventListener('click', async () => {
+    const key = th.dataset.sort;
+    if (state.sortBy === key) state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+    else { state.sortBy = key; state.sortDir = 'asc'; }
+    await saveState();
+    renderTable();
+    // update header classes
+    document.querySelectorAll('th[data-sort]').forEach(x => x.classList.remove('sort-asc','sort-desc'));
+    th.classList.add(state.sortDir === 'asc' ? 'sort-asc' : 'sort-desc');
+  });
+});
+
+/* ===== Ініціалізація ===== */
+async function init(forceReload=false) {
+  setStatus('завантаження мат чесів…');
+  // load state first (so color & sort preferences will apply instantly)
+  await loadState();
+  document.documentElement.style.setProperty('--seen-color', state.selectedColor);
+  colorSelect.value = state.selectedColor;
+
+  // load matches
+  matches = await fetchMatchesFromServer();
+  if (!matches.length) setStatus('список матчів порожній (завантажте через /admin.html)');
+  else setStatus(`завантажено ${matches.length} матчів`);
+  renderTable();
+}
+
+/* старт */
+init();
+</script>
+</body>
+</html>
