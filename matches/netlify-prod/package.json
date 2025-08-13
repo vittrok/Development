@@ -1,0 +1,12 @@
+{
+  "name": "football-matches-tracker",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@neondatabase/serverless": "^1.10.0",
+    "dotenv": "^16.4.5"
+  },
+  "scripts": {
+    "updateMatches": "node updateMatches.js"
+  }
+}
