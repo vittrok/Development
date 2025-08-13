@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "@neondatabase/serverless": "^1.10.0",
+    "@neondatabase/serverless": "^0.10.3",
     "dotenv": "^16.4.5"
   },
   "scripts": {
