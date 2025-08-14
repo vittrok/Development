@@ -4,6 +4,6 @@
 
 # Розклад увімкнеш пізніше — спершу протестуй ручний виклик.
 # Коли будеш готовий, розкоментуй нижче:
-# [[scheduled.functions]]
-#   function = "update-matches"
-#   cron = "0 3 * * *"   # щодня о 03:00 UTC (зміни за потреби)
+[[scheduled.functions]]
+  function = "update-matches"
+  cron = "0 3 * * *"   # щодня о 03:00 UTC (зміни за потреби)
