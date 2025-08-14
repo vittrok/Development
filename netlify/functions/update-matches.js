@@ -1,11 +1,5 @@
-// netlify/functions/update-matches.js
-const { Client } = require("@neondatabase/serverless");
-
+// netlify/functions/update-matches.js (CommonJS)
 exports.handler = async function (event, context) {
-  const client = new Client({
-    connectionString: process.env.NEON_DB_URL, // твій Neon URL
-  });
-
   try {
     await client.connect();
 
@@ -24,10 +18,9 @@ exports.handler = async function (event, context) {
     return {
       statusCode: 200,
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ok: true, matches }),
+      body: JSON.stringify({ ok: true, message: "Stub sync ran" }),
     };
   } catch (err) {
-    await client.end();
     return {
       statusCode: 500,
       headers: { "content-type": "application/json" },
