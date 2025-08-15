@@ -42,7 +42,7 @@ exports.handler = async (event) => {
 
   // приймаємо #rgb/#rrggbb або невеликий whitelist назв
   const okHex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(value);
-  const okName = /^(?:red|green|blue|yellow|orange|purple|pink|lightyellow|lightpink|lightgreen|lightblue|gray|grey|white|black)$/i.test(value);
+  const okName = /^(?:red|green|blue|yellow|orange|purple|pink|lightyellow|lightpink|lightgreen|lightblue|lightgray|lightcyan|lightcoral|lightgoldenrodyellow|gray|grey|white|black)$/i.test(value);
   if (!okHex && !okName) {
     return { statusCode: 400, headers: corsHeaders(), body: 'invalid color' };
   }
