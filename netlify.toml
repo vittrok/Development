@@ -1,9 +1,8 @@
 [build]
-  publish = "./"
-  functions = "netlify/functions"
+  publish = "public"
+  functions = "functions"
 
-# Розклад увімкнеш пізніше — спершу протестуй ручний виклик.
-# Коли будеш готовий, розкоментуй нижче:
-[[scheduled.functions]]
-  function = "update-matches"
-  cron = "0 3 * * *"   # щодня о 03:00 UTC (зміни за потреби)
+# Enable later if you want scheduled syncs:
+# [[scheduled.functions]]
+#   function = "update-matches"
+#   cron = "0 3 * * *"   # daily at 03:00 UTC

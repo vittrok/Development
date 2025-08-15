@@ -1,0 +1,9 @@
+{
+  "name": "football-matches-netlify-neon",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "pg": "^8.11.5",
+    "dotenv": "^16.4.5"
+  }
+}
