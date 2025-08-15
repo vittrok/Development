@@ -4,10 +4,21 @@ async function j(url, opts) {
   return res.json();
 }
 
+function showStatus(msg, isError=false) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.classList.toggle('error', !!isError);
+  el.style.display = msg ? 'block' : 'none';
+  if (!isError) {
+    // автохов через 3с
+    setTimeout(() => { el.style.display = 'none'; }, 3000);
+  }
+}
+
 function renderMatches(data, seenColor) {
   const tbody = document.querySelector('#matches tbody');
   tbody.innerHTML = '';
-  const rows = data.matches;
+  const rows = data.matches || [];
   rows.forEach((row, i) => {
     const tr = document.createElement('tr');
     tr.dataset.date = row.date;
@@ -48,7 +59,7 @@ function renderMatches(data, seenColor) {
           headers: {'Content-Type':'application/json'},
           body: JSON.stringify({ date: row.date, match: row.match, seen: chk.checked })
         });
-      } catch(e){ console.error(e); }
+      } catch(e){ console.error(e); showStatus('Не вдалось оновити "seen"', true); }
     });
 
     let t;
@@ -61,7 +72,7 @@ function renderMatches(data, seenColor) {
             headers: {'Content-Type':'application/json'},
             body: JSON.stringify({ date: row.date, match: row.match, comments: input.value })
           });
-        } catch(e){ console.error(e); }
+        } catch(e){ console.error(e); showStatus('Не вдалось зберегти коментар', true); }
       }, 400);
     });
 
@@ -86,40 +97,63 @@ function attachSortHandlers() {
     th.addEventListener('click', async () => {
       const hasAsc = th.textContent.endsWith('▲');
       const newOrder = hasAsc ? 'desc' : 'asc';
-      await j('/.netlify/functions/setSort', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ column: col, order: newOrder })
-      });
-      await loadAndRender();
+      try {
+        await j('/.netlify/functions/setSort', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ column: col, order: newOrder })
+        });
+        await loadAndRender();
+      } catch (e) {
+        console.error(e);
+        showStatus('Не вдалось змінити сортування', true);
+      }
     });
   });
 }
 
-async function loadPreferences() {
-  return j('/.netlify/functions/getPreferences');
+async function loadPreferencesSafe() {
+  try {
+    return await j('/.netlify/functions/getPreferences');
+  } catch (e) {
+    console.error('getPreferences error:', e);
+    // дефолти, якщо преференси ще не створені
+    return { seen_color: 'lightyellow', sort: { column: 'date', order: 'asc' } };
+  }
 }
 
 async function loadAndRender() {
   try {
-    const prefs = await loadPreferences();
+    showStatus('Завантаження…');
+    const prefs = await loadPreferencesSafe();
     const data = await j('/.netlify/functions/getMatches');
     const color = prefs.seen_color || 'lightyellow';
     document.documentElement.style.setProperty('--seen-bg', color);
-    document.getElementById('seenColor').value = color;
+    const sel = document.getElementById('seenColor');
+    if (sel) sel.value = color;
     renderMatches(data, color);
-  } catch(e){ console.error(e); }
+    showStatus('Готово');
+  } catch(e){
+    console.error(e);
+    showStatus('Помилка завантаження даних', true);
+  }
 }
 
 document.getElementById('seenColor').addEventListener('change', async (e) => {
   const val = e.target.value;
   document.documentElement.style.setProperty('--seen-bg', val);
-  await j('/.netlify/functions/setPreference', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ key: 'seen_color', value: val })
-  });
-  document.querySelectorAll('tr.seen').forEach(tr => tr.style.backgroundColor = val);
+  try {
+    await j('/.netlify/functions/setPreference', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ key: 'seen_color', value: val })
+    });
+    document.querySelectorAll('tr.seen').forEach(tr => tr.style.backgroundColor = val);
+    showStatus('Колір збережено');
+  } catch (e) {
+    console.error(e);
+    showStatus('Не вдалось зберегти колір', true);
+  }
 });
 
 document.getElementById('syncBtn').addEventListener('click', async () => {
@@ -129,15 +163,15 @@ document.getElementById('syncBtn').addEventListener('click', async () => {
   btn.textContent = 'Синхронізую...';
   try {
     const res = await j('/.netlify/functions/update-matches');
-    alert(`Синхронізація завершена. Додано: ${res.newMatches || 0}, пропущено: ${res.skippedMatches || 0}`);
+    showStatus(`Синхронізація: додано ${res.newMatches || 0}, пропущено ${res.skippedMatches || 0}`);
     await loadAndRender();
-    // if logs tab active, refresh logs
+    // якщо активна вкладка логів — перезавантажимо її
     if (document.querySelector('.tab-btn.active')?.dataset.tab === 'logs') {
       document.querySelector('.tab-btn[data-tab="logs"]').click();
     }
   } catch(e){
     console.error(e);
-    alert('Помилка синхронізації');
+    showStatus('Помилка синхронізації', true);
   } finally {
     btn.disabled = false;
     btn.textContent = old;
@@ -157,14 +191,14 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
         const data = await j('/.netlify/functions/getSyncLogs');
         const tbody = document.querySelector('#logs tbody');
         tbody.innerHTML = '';
-        for (const r of data.logs) {
+        for (const r of data.logs || []) {
           const tr = document.createElement('tr');
           const dt = new Date(r.sync_time);
           const local = isNaN(dt.getTime()) ? r.sync_time : dt.toLocaleString();
           tr.innerHTML = `<td>${local}</td><td>${r.trigger_type}</td><td>${r.client_ip || ''}</td><td>${r.new_matches}</td><td>${r.skipped_matches}</td>`;
           tbody.appendChild(tr);
         }
-      } catch(e){ console.error(e); }
+      } catch(e){ console.error(e); showStatus('Не вдалось завантажити логи', true); }
     }
   });
 });
