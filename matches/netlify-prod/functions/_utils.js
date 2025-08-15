@@ -22,9 +22,10 @@ function corsHeaders(origin = ORIGIN) {
 }
 function isAllowedOrigin(event) {
   const o = event.headers.origin || '';
-  // allow if no APP_ORIGIN set (dev) or exact match in prod
-  return !ORIGIN || o === ORIGIN;
+  // Allow if Origin matches or header is missing (same-origin GETs)
+  return !ORIGIN || o === ORIGIN || !o;
 }
+
 function handleOptions() {
   return { statusCode: 204, headers: corsHeaders() };
 }
