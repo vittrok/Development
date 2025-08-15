@@ -1,30 +1,60 @@
-const { getClient } = require('./_db');
+// functions/update-matches.js
+const {
+  pool,
+  corsHeaders,
+  handleOptions,
+  isAllowedOrigin,
+  requireAdmin,
+  rateLimit,
+} = require('./_utils');
 
-exports.handler = async function(event, context) {
-  const client = getClient();
-  const trigger = event.headers && event.headers['x-netlify-scheduled-event'] ? 'cron' : 'manual';
-  const ip = (event.headers && (event.headers['x-forwarded-for'] || event.headers['client-ip'])) || '';
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return handleOptions(event);
+  if (!isAllowedOrigin(event)) return { statusCode: 403, body: 'forbidden' };
+  if (!requireAdmin(event)) return { statusCode: 401, headers: corsHeaders(), body: 'unauthorized' };
+
+  const ip = event.headers['x-nf-client-connection-ip'] || 'admin';
+  // Жорсткий ліміт: не частіше 1 раз/5 хв на IP
+  const { limited, reset } = await rateLimit(`admin:sync:${ip}`, 1, 300);
+  if (limited) {
+    return {
+      statusCode: 429,
+      headers: { ...corsHeaders(), 'Retry-After': Math.ceil((reset - new Date()) / 1000) },
+      body: JSON.stringify({ error: 'rate_limited' }),
+    };
+  }
 
   try {
-    await client.connect();
+    const trigger = event.queryStringParameters?.trigger || 'manual';
+    const client_ip = event.headers['x-nf-client-connection-ip'] || '';
 
-    // Placeholder for real sync (CSV/API). For now, just log an entry.
-    const newMatches = 0;
-    const skippedMatches = 0;
+    // TODO: підключити реальне джерело даних (CSV/API) і заповнити fetched[]
+    const fetched = []; // [{date, match, tournament, link}, ...]
+    let inserted = 0, skipped = 0;
 
-    await client.query(
-      "INSERT INTO sync_logs(trigger_type, client_ip, new_matches, skipped_matches) VALUES ($1,$2,$3,$4)",
-      [trigger, ip, newMatches, skippedMatches]
+    for (const m of fetched) {
+      const res = await pool.query(
+        `INSERT INTO matches(date, match, tournament, link)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (date, match) DO NOTHING
+         RETURNING 1`,
+        [m.date, m.match, m.tournament, m.link]
+      );
+      if (res.rowCount > 0) inserted++; else skipped++;
+    }
+
+    await pool.query(
+      `INSERT INTO sync_logs(trigger_type, client_ip, new_matches, skipped_matches)
+       VALUES ($1,$2,$3,$4)`,
+      [trigger, client_ip, inserted, skipped]
     );
 
     return {
       statusCode: 200,
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ok: true, trigger, newMatches, skippedMatches })
+      headers: corsHeaders(),
+      body: JSON.stringify({ ok: true, trigger, newMatches: inserted, skippedMatches: skipped }),
     };
   } catch (e) {
-    return { statusCode: 500, body: JSON.stringify({ error: String(e) }) };
-  } finally {
-    await client.end();
+    return { statusCode: 500, headers: corsHeaders(), body: JSON.stringify({ error: String(e) }) };
   }
 };
