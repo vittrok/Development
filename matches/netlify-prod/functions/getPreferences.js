@@ -12,7 +12,7 @@ exports.handler = async function() {
     let sort = { column: 'date', order: 'asc' };
     const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
     if (p.rowCount) {
-      const allowed = ['match','tournament','date','link','seen','comments'];
+      const allowed = ['rank','match','tournament','date','link','seen','comments'];
       const col = allowed.includes(p.rows[0].sort_col) ? p.rows[0].sort_col : 'date';
       const ord = p.rows[0].sort_order === 'desc' ? 'desc' : 'asc';
       sort = { column: col, order: ord };
