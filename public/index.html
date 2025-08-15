@@ -5,9 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Football Matches Tracker</title>
   <link rel="stylesheet" href="style.css" />
+  <style>
+    #status { margin-bottom:10px; padding:8px 12px; border:1px solid #e5c07b; background:#fff8e1; color:#6b5e2e; display:none; }
+    #status.error { border-color:#e57373; background:#ffebee; color:#b71c1c; }
+  </style>
 </head>
 <body>
   <h1>Top Football Matches</h1>
+
+  <div id="status"></div>
 
   <div class="toolbar">
     <button id="syncBtn">Синхронізувати матчі з БД</button>
