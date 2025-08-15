@@ -1,10 +1,21 @@
+let CSRF = null; // will store token from getPreferences
+
 async function j(url, opts) {
-  const res = await fetch(url, opts);
+  // automatically inject CSRF token into POST requests
+  const finalOpts = { ...opts };
+  if (finalOpts && finalOpts.method && finalOpts.method.toUpperCase() === 'POST') {
+    finalOpts.headers = {
+      ...(finalOpts.headers || {}),
+      'X-CSRF': CSRF,
+      'X-Requested-With': 'fetch',
+    };
+  }
+  const res = await fetch(url, finalOpts);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
-function showStatus(msg, isError=false) {
+function showStatus(msg, isError = false) {
   const el = document.getElementById('status');
   el.textContent = msg;
   el.classList.toggle('error', !!isError);
@@ -21,7 +32,7 @@ function renderMatches(data, seenColor) {
     tr.dataset.date = row.date;
     tr.dataset.match = row.match;
 
-    // # — тепер це ПРАВИЛЬНЕ ПОЛЕ rank з БД
+    // rank (#)
     const c0 = document.createElement('td'); c0.textContent = row.rank ?? ''; tr.appendChild(c0);
     // match
     const c1 = document.createElement('td'); c1.textContent = row.match; tr.appendChild(c1);
@@ -32,8 +43,13 @@ function renderMatches(data, seenColor) {
     // link
     const c4 = document.createElement('td');
     if (row.link) {
-      const a = document.createElement('a'); a.href = row.link; a.textContent = row.link; a.target = "_blank"; a.rel="noopener";
-      a.className = "link"; c4.appendChild(a);
+      const a = document.createElement('a');
+      a.href = row.link;
+      a.textContent = row.link;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.className = "link";
+      c4.appendChild(a);
     } else { c4.textContent = ''; }
     tr.appendChild(c4);
     // seen
@@ -53,10 +69,10 @@ function renderMatches(data, seenColor) {
       try {
         await j('/.netlify/functions/updateMatch', {
           method: 'POST',
-          headers: {'Content-Type':'application/json'},
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ date: row.date, match: row.match, seen: chk.checked })
         });
-      } catch(e){ console.error(e); showStatus('Не вдалось оновити "seen"', true); }
+      } catch (e) { console.error(e); showStatus('Не вдалось оновити "seen"', true); }
     });
 
     let t;
@@ -66,10 +82,10 @@ function renderMatches(data, seenColor) {
         try {
           await j('/.netlify/functions/updateMatch', {
             method: 'POST',
-            headers: {'Content-Type':'application/json'},
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ date: row.date, match: row.match, comments: input.value })
           });
-        } catch(e){ console.error(e); showStatus('Не вдалось зберегти коментар', true); }
+        } catch (e) { console.error(e); showStatus('Не вдалось зберегти коментар', true); }
       }, 400);
     });
 
@@ -95,7 +111,7 @@ function attachSortHandlers() {
       try {
         await j('/.netlify/functions/setSort', {
           method: 'POST',
-          headers: {'Content-Type':'application/json'},
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ column: col, order: newOrder })
         });
         await loadAndRender();
@@ -109,7 +125,9 @@ function attachSortHandlers() {
 
 async function loadPreferencesSafe() {
   try {
-    return await j('/.netlify/functions/getPreferences');
+    const prefs = await j('/.netlify/functions/getPreferences');
+    CSRF = prefs.csrf; // store CSRF from backend
+    return prefs;
   } catch (e) {
     console.error('getPreferences error:', e);
     return { seen_color: 'lightyellow', sort: { column: 'date', order: 'asc' } };
@@ -127,7 +145,7 @@ async function loadAndRender() {
     if (sel) sel.value = color;
     renderMatches(data, color);
     showStatus('Готово');
-  } catch(e){
+  } catch (e) {
     console.error(e);
     showStatus('Помилка завантаження даних', true);
   }
@@ -139,7 +157,7 @@ document.getElementById('seenColor').addEventListener('change', async (e) => {
   try {
     await j('/.netlify/functions/setPreference', {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: 'seen_color', value: val })
     });
     document.querySelectorAll('tr.seen').forEach(tr => tr.style.backgroundColor = val);
@@ -162,7 +180,7 @@ document.getElementById('syncBtn').addEventListener('click', async () => {
     if (document.querySelector('.tab-btn.active')?.dataset.tab === 'logs') {
       document.querySelector('.tab-btn[data-tab="logs"]').click();
     }
-  } catch(e){
+  } catch (e) {
     console.error(e);
     showStatus('Помилка синхронізації', true);
   } finally {
@@ -191,7 +209,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
           tr.innerHTML = `<td>${local}</td><td>${r.trigger_type}</td><td>${r.client_ip || ''}</td><td>${r.new_matches}</td><td>${r.skipped_matches}</td>`;
           tbody.appendChild(tr);
         }
-      } catch(e){ console.error(e); showStatus('Не вдалось завантажити логи', true); }
+      } catch (e) { console.error(e); showStatus('Не вдалось завантажити логи', true); }
     }
   });
 });
