@@ -9,23 +9,20 @@ function showStatus(msg, isError=false) {
   el.textContent = msg;
   el.classList.toggle('error', !!isError);
   el.style.display = msg ? 'block' : 'none';
-  if (!isError) {
-    // автохов через 3с
-    setTimeout(() => { el.style.display = 'none'; }, 3000);
-  }
+  if (!isError) setTimeout(() => { el.style.display = 'none'; }, 3000);
 }
 
 function renderMatches(data, seenColor) {
   const tbody = document.querySelector('#matches tbody');
   tbody.innerHTML = '';
   const rows = data.matches || [];
-  rows.forEach((row, i) => {
+  rows.forEach((row) => {
     const tr = document.createElement('tr');
     tr.dataset.date = row.date;
     tr.dataset.match = row.match;
 
-    // # index based on current sort order
-    const c0 = document.createElement('td'); c0.textContent = i + 1; tr.appendChild(c0);
+    // # — тепер це ПРАВИЛЬНЕ ПОЛЕ rank з БД
+    const c0 = document.createElement('td'); c0.textContent = row.rank ?? ''; tr.appendChild(c0);
     // match
     const c1 = document.createElement('td'); c1.textContent = row.match; tr.appendChild(c1);
     // tournament
@@ -82,10 +79,9 @@ function renderMatches(data, seenColor) {
   // headers arrows
   document.querySelectorAll('th[data-col]').forEach(th => {
     const col = th.dataset.col;
-    if (col === '#') { th.textContent = '#'; return; }
-    th.textContent = col;
+    th.textContent = (col === 'rank') ? '#' : col;
     if (data.sort && data.sort.column === col) {
-      th.textContent = col + (data.sort.order === 'asc' ? ' ▲' : ' ▼');
+      th.textContent += (data.sort.order === 'asc' ? ' ▲' : ' ▼');
     }
   });
 }
@@ -93,9 +89,8 @@ function renderMatches(data, seenColor) {
 function attachSortHandlers() {
   document.querySelectorAll('th[data-col]').forEach(th => {
     const col = th.dataset.col;
-    if (col === '#') return;
     th.addEventListener('click', async () => {
-      const hasAsc = th.textContent.endsWith('▲');
+      const hasAsc = th.textContent.trim().endsWith('▲');
       const newOrder = hasAsc ? 'desc' : 'asc';
       try {
         await j('/.netlify/functions/setSort', {
@@ -117,7 +112,6 @@ async function loadPreferencesSafe() {
     return await j('/.netlify/functions/getPreferences');
   } catch (e) {
     console.error('getPreferences error:', e);
-    // дефолти, якщо преференси ще не створені
     return { seen_color: 'lightyellow', sort: { column: 'date', order: 'asc' } };
   }
 }
@@ -165,7 +159,6 @@ document.getElementById('syncBtn').addEventListener('click', async () => {
     const res = await j('/.netlify/functions/update-matches');
     showStatus(`Синхронізація: додано ${res.newMatches || 0}, пропущено ${res.skippedMatches || 0}`);
     await loadAndRender();
-    // якщо активна вкладка логів — перезавантажимо її
     if (document.querySelector('.tab-btn.active')?.dataset.tab === 'logs') {
       document.querySelector('.tab-btn[data-tab="logs"]').click();
     }
@@ -191,7 +184,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
         const data = await j('/.netlify/functions/getSyncLogs');
         const tbody = document.querySelector('#logs tbody');
         tbody.innerHTML = '';
-        for (const r of data.logs || []) {
+        for (const r of (data.logs || [])) {
           const tr = document.createElement('tr');
           const dt = new Date(r.sync_time);
           const local = isNaN(dt.getTime()) ? r.sync_time : dt.toLocaleString();

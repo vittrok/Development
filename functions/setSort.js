@@ -1,5 +1,5 @@
 const { getClient } = require('./_db');
-const ALLOWED = ['match','tournament','date','link','seen','comments'];
+const ALLOWED = ['rank','match','tournament','date','link','seen','comments'];
 
 exports.handler = async function(event) {
   const client = getClient();

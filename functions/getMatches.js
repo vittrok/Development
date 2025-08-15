@@ -7,15 +7,22 @@ exports.handler = async function() {
     // read sort
     const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
     let sortCol = 'date', sortOrder = 'asc';
-    const allowed = ['match','tournament','date','link','seen','comments'];
+    const allowed = ['rank','match','tournament','date','link','seen','comments'];
     if (p.rowCount) {
       const col = p.rows[0].sort_col;
       const ord = p.rows[0].sort_order;
       if (allowed.includes(col)) sortCol = col;
       if (ord === 'desc') sortOrder = 'desc';
     }
-    const rows = await client.query(`SELECT match, tournament, date, link, seen, comments FROM matches ORDER BY ${sortCol} ${sortOrder}`);
+
+    const rows = await client.query(`
+      SELECT rank, match, tournament, date, link, seen, comments
+      FROM matches
+      ORDER BY ${sortCol} ${sortOrder} NULLS LAST, rank ASC
+    `);
+
     const matches = rows.rows.map(r => ({
+      rank: r.rank,
       match: r.match,
       tournament: r.tournament,
       date: r.date instanceof Date ? r.date.toISOString().slice(0,10) : r.date,
@@ -23,6 +30,7 @@ exports.handler = async function() {
       seen: r.seen,
       comments: r.comments
     }));
+
     return {
       statusCode: 200,
       headers: { 'content-type': 'application/json' },
