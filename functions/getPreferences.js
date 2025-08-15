@@ -1,31 +1,44 @@
-const { getClient } = require('./_db');
+// functions/getPreferences.js
+const {
+  pool,
+  corsHeaders,
+  handleOptions,
+  isAllowedOrigin,
+  signCsrf,
+} = require('./_utils');
 
-exports.handler = async function() {
-  const client = getClient();
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return handleOptions(event);
+  if (!isAllowedOrigin(event)) return { statusCode: 403, body: 'forbidden' };
+
   try {
-    await client.connect();
+    // settings: seen_color
+    const res = await pool.query(`SELECT key, value FROM settings`);
+    const prefs = Object.fromEntries(res.rows.map(r => [r.key, r.value]));
 
-    let seenColor = 'lightyellow';
-    const s = await client.query("SELECT value FROM settings WHERE key='seen_color' LIMIT 1");
-    if (s.rowCount) seenColor = s.rows[0].value;
+    // preferences: sort
+    const sortRes = await pool.query(`SELECT sort_col, sort_order FROM preferences LIMIT 1`);
+    const sort = sortRes.rows[0] || null;
 
-    let sort = { column: 'date', order: 'asc' };
-    const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
-    if (p.rowCount) {
-      const allowed = ['rank','match','tournament','date','link','seen','comments'];
-      const col = allowed.includes(p.rows[0].sort_col) ? p.rows[0].sort_col : 'date';
-      const ord = p.rows[0].sort_order === 'desc' ? 'desc' : 'asc';
-      sort = { column: col, order: ord };
-    }
+    // CSRF (bind to IP + UA, TTL 2h)
+    const ip = event.headers['x-nf-client-connection-ip'] || '';
+    const ua = event.headers['user-agent'] || '';
+    const csrf = signCsrf({ ip, ua, ts: Date.now() });
 
     return {
       statusCode: 200,
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ seen_color: seenColor, sort })
+      headers: corsHeaders(),
+      body: JSON.stringify({
+        seen_color: prefs.seen_color || null,
+        sort,
+        csrf,
+      }),
     };
   } catch (e) {
-    return { statusCode: 500, body: JSON.stringify({ error: String(e) }) };
-  } finally {
-    await client.end();
+    return {
+      statusCode: 500,
+      headers: corsHeaders(),
+      body: JSON.stringify({ error: String(e) }),
+    };
   }
 };
