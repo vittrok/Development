@@ -48,3 +48,32 @@ CREATE TABLE IF NOT EXISTS sync_logs (
   new_matches INT DEFAULT 0,
   skipped_matches INT DEFAULT 0
 );
+
+-- users (single admin for now)
+CREATE TABLE IF NOT EXISTS users(
+  id SERIAL PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('admin','user')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_login_at TIMESTAMPTZ
+);
+
+-- sessions
+CREATE TABLE IF NOT EXISTS sessions(
+  sid TEXT PRIMARY KEY,
+  user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  issued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked BOOLEAN NOT NULL DEFAULT false
+);
+
+-- rate_limits (fixed window)
+CREATE TABLE IF NOT EXISTS rate_limits(
+  key TEXT PRIMARY KEY,
+  count INT NOT NULL,
+  reset_at TIMESTAMPTZ NOT NULL
+);
+
+-- seed single admin from env on first login: row is created lazily by /login
+-- (тобто /login сам створює користувача, якщо його ще немає)
