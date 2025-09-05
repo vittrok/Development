@@ -1,4 +1,6 @@
-const { corsHeaders, parseCookies, getSession, userAgent, clientIp, signCsrf } = require('./_utils');
+const { getPool, corsHeaders, setCookie, parseCookies, createSession, checkAndIncRateLimit, clientIp, userAgent } = require('./_utils');
+const pool = getPool();
+
 
 exports.handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') {

@@ -1,4 +1,6 @@
-const { corsHeaders, parseCookies, getSession } = require('./_utils');
+const { getPool, corsHeaders, setCookie, parseCookies, createSession, checkAndIncRateLimit, clientIp, userAgent } = require('./_utils');
+const pool = getPool();
+
 
 function requireAuth(handler) {
   return async (event) => {
