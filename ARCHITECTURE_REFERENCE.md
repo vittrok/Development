@@ -4,6 +4,8 @@
 **Owner:** Vitalii (single admin user)  
 **Hosting:** Netlify (publish=public, functions=functions)  
 **DB:** Neon Postgres  
+**Project:** matches  
+**Database name (internal Neon):** damp-art-10747800
 **Frontend:** Vanilla HTML/JS/CSS  
 **Functions:** Netlify Functions (CommonJS, `exports.handler`)  
 
