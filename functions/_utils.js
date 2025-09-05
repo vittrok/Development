@@ -18,10 +18,14 @@ if (!SESSION_SECRET) throw new Error('SESSION_SECRET is not set');
 if (!CSRF_SECRET) throw new Error('CSRF_SECRET is not set');
 
 // ---- PG POOL (singleton) ----
-let _pool;
+let _pool = null;
 function getPool() {
   if (!_pool) {
-    _pool = new Pool({ connectionString: DATABASE_URL });
+    const { Pool } = require('pg');
+    _pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false }  // <— важливо для Neon/Supabase
+    });
   }
   return _pool;
 }
