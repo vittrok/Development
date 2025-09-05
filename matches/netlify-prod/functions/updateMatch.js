@@ -10,6 +10,11 @@ const {
   validDate
 } = require('./_utils');
 
+const { requireAuth } = require('./_auth');
+exports.handler = requireAuth(async (event) => {
+  // ... існуюча логіка + перевірка CSRF як і раніше
+});
+
 exports.handler = async (event) => {
   // Handle CORS preflight
   if (event.httpMethod === 'OPTIONS') return handleOptions(event);
