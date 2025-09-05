@@ -1,109 +1,218 @@
-// functions/_utils.js (CommonJS)
+// matches/netlify-prod/functions/_utils.js
+// CommonJS, Netlify Functions compatible
+
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const bcrypt = require('bcryptjs'); // для /login
 
-// ----- env -----
-const ORIGIN = process.env.APP_ORIGIN;                   // e.g. https://football-m.netlify.app
-const ADMIN = `Bearer ${process.env.ADMIN_TOKEN}`;
-const CSRF_SECRET = process.env.CSRF_SECRET;
+// ---- ENV ----
+const {
+  APP_ORIGIN,
+  DATABASE_URL,
+  SESSION_SECRET,
+  CSRF_SECRET
+} = process.env;
 
-// ----- pg pool (shared) -----
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+if (!DATABASE_URL) throw new Error('DATABASE_URL is not set');
+if (!SESSION_SECRET) throw new Error('SESSION_SECRET is not set');
+if (!CSRF_SECRET) throw new Error('CSRF_SECRET is not set');
 
-// ----- CORS helpers -----
-function corsHeaders(origin = ORIGIN) {
+// ---- PG POOL (singleton) ----
+let _pool;
+function getPool() {
+  if (!_pool) {
+    _pool = new Pool({ connectionString: DATABASE_URL });
+  }
+  return _pool;
+}
+
+// ---- CORS ----
+function corsHeaders() {
   return {
-    'Access-Control-Allow-Origin': origin || '*',
+    'Access-Control-Allow-Origin': APP_ORIGIN || 'https://example.com',
     'Vary': 'Origin',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, X-CSRF',
-    'Access-Control-Max-Age': '600',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With, X-CSRF',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
   };
 }
-function isAllowedOrigin(event) {
-  const o = event.headers.origin || '';
-  // Allow if Origin matches or header is missing (same-origin GETs)
-  return !ORIGIN || o === ORIGIN || !o;
+
+// ---- COOKIES ----
+function setCookie(name, value, { maxAgeSec = 60 * 60 * 24 * 30 } = {}) {
+  return `${name}=${encodeURIComponent(value)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}`;
+}
+function clearCookie(name) {
+  return `${name}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
+}
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  const raw = Array.isArray(header) ? header.join(';') : header;
+  raw.split(';').forEach((part) => {
+    const [k, ...rest] = part.trim().split('=');
+    if (!k) return;
+    out[k] = decodeURIComponent((rest.join('=') || '').trim());
+  });
+  return out;
 }
 
-function handleOptions() {
-  return { statusCode: 204, headers: corsHeaders() };
+// ---- HELPERS (IP/UA) ----
+function clientIp(event) {
+  return (event.headers['x-forwarded-for'] || '').split(',')[0]?.trim() || 'ip:unknown';
+}
+function userAgent(event) {
+  return event.headers['user-agent'] || 'ua:unknown';
 }
 
-// ----- admin bearer auth -----
-function requireAdmin(event) {
-  const got = event.headers.authorization || '';
-  return got === ADMIN;
+// ---- SESSIONS (cookie: "session" = "<sid>.<sig>") ----
+function signSid(sid) {
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(sid).digest('base64url');
+  return `${sid}.${sig}`;
+}
+function verifySid(signed) {
+  const [sid, sig] = (signed || '').split('.');
+  if (!sid || !sig) return null;
+  const good = crypto.createHmac('sha256', SESSION_SECRET).update(sid).digest('base64url');
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) return null;
+  } catch {
+    return null;
+  }
+  return sid;
 }
 
-// ----- stateless CSRF (HMAC-signed) -----
+async function createSession(userId, ttlDays = 30) {
+  const pool = getPool();
+  const sid = crypto.randomBytes(24).toString('base64url');
+  const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000);
+  await pool.query(
+    'INSERT INTO sessions(sid, user_id, expires_at) VALUES ($1,$2,$3)',
+    [sid, userId, expiresAt]
+  );
+  return signSid(sid);
+}
+
+async function getSession(signedSid) {
+  const pool = getPool();
+  const sid = verifySid(signedSid);
+  if (!sid) return null;
+
+  const { rows } = await pool.query(
+    `SELECT s.sid, s.expires_at, s.revoked,
+            u.id AS user_id, u.username, u.role
+       FROM sessions s
+       JOIN users u ON s.user_id = u.id
+      WHERE s.sid = $1`,
+    [sid]
+  );
+  if (!rows.length) return null;
+  const r = rows[0];
+  if (r.revoked) return null;
+  if (new Date(r.expires_at) < new Date()) return null;
+  return r;
+}
+
+async function revokeSession(signedSid) {
+  const pool = getPool();
+  const sid = verifySid(signedSid);
+  if (!sid) return;
+  await pool.query('UPDATE sessions SET revoked=true WHERE sid=$1', [sid]);
+}
+
+// ---- RATE LIMIT (fixed window) ----
+async function checkAndIncRateLimit(key, limit, windowSec) {
+  const pool = getPool();
+  const now = new Date();
+  const resetAt = new Date(now.getTime() + windowSec * 1000);
+
+  await pool.query(
+    `INSERT INTO rate_limits(key, count, reset_at)
+         VALUES ($1, 1, $2)
+     ON CONFLICT (key) DO UPDATE SET
+         count = CASE WHEN rate_limits.reset_at < now() THEN 1 ELSE rate_limits.count + 1 END,
+         reset_at = CASE WHEN rate_limits.reset_at < now() THEN $2 ELSE rate_limits.reset_at END`,
+    [key, resetAt]
+  );
+
+  const { rows } = await pool.query('SELECT count, reset_at FROM rate_limits WHERE key=$1', [key]);
+  const row = rows[0];
+  const remaining = limit - row.count;
+  const retryAfterSec = Math.max(1, Math.ceil((new Date(row.reset_at) - now) / 1000));
+  return { limited: row.count > limit, retryAfterSec, remaining };
+}
+
+// ---- CSRF (stateless HMAC) ----
 function signCsrf(payload) {
-  const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const data = JSON.stringify(payload || {});
   const sig = crypto.createHmac('sha256', CSRF_SECRET).update(data).digest('base64url');
-  return `${data}.${sig}`;
+  return `${Buffer.from(data).toString('base64url')}.${sig}`;
 }
-function verifyCsrf(token, bind) {
-  if (!token) return false;
-  const [data, sig] = token.split('.');
-  const good = crypto.createHmac('sha256', CSRF_SECRET).update(data).digest('base64url');
-  if (sig !== good) return false;
-  let obj;
-  try { obj = JSON.parse(Buffer.from(data, 'base64url').toString()); }
-  catch { return false; }
-  const now = Date.now();
-  if (!obj.ts || now - obj.ts > 2 * 60 * 60 * 1000) return false; // TTL 2h
-  if (bind && (obj.ip !== bind.ip || obj.ua !== bind.ua)) return false;
+
+function verifyCsrf(token, bind = {}) {
+  if (!token || typeof token !== 'string') return false;
+  const [b64, sig] = token.split('.');
+  if (!b64 || !sig) return false;
+
+  const dataBuf = Buffer.from(b64, 'base64url');
+  let payload;
+  try {
+    payload = JSON.parse(dataBuf.toString('utf8'));
+  } catch {
+    return false;
+  }
+
+  const goodSig = crypto.createHmac('sha256', CSRF_SECRET).update(JSON.stringify(payload)).digest('base64url');
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(goodSig))) return false;
+  } catch {
+    return false;
+  }
+
+  if (bind.ip && payload.ip && bind.ip !== payload.ip) return false;
+  if (bind.ua && payload.ua && bind.ua !== payload.ua) return false;
+
+  const ttlMs = typeof bind.ttlMs === 'number' ? bind.ttlMs : (2 * 60 * 60 * 1000);
+  if (typeof payload.ts === 'number') {
+    const age = Date.now() - payload.ts;
+    if (age < 0 || age > ttlMs) return false;
+  } else {
+    return false;
+  }
+
   return true;
 }
 
-// ----- simple rate limit backed by Postgres -----
-// create table once in DB (we'll run this later in step 9):
-// CREATE TABLE IF NOT EXISTS rate_limits(
-//   key TEXT PRIMARY KEY,
-//   count INT NOT NULL,
-//   reset_at TIMESTAMP NOT NULL
-// );
-async function rateLimit(key, limit, windowSec) {
-  const res = await pool.query(`
-    INSERT INTO rate_limits(key, count, reset_at)
-    VALUES ($1, 1, NOW() + make_interval(secs => $2))
-    ON CONFLICT (key)
-    DO UPDATE SET
-      count = CASE WHEN rate_limits.reset_at < NOW() THEN 1 ELSE rate_limits.count + 1 END,
-      reset_at = CASE WHEN rate_limits.reset_at < NOW() THEN NOW() + make_interval(secs => $2) ELSE rate_limits.reset_at END
-    RETURNING count, reset_at
-  `, [key, windowSec]);
-  const row = res.rows[0];
-  const remaining = Math.max(0, limit - row.count);
-  const reset = new Date(row.reset_at);
-  const limited = row.count > limit;
-  return { limited, remaining, reset };
-}
-
-// ----- input guards -----
-function safeJson(body) {
-  try { return JSON.parse(body || '{}'); } catch { return null; }
-}
-function sanitizeComment(s) {
-  if (typeof s !== 'string') return null;
-  s = s.slice(0, 2000);
-  return s.replace(/[^\p{L}\p{N}\p{P}\p{Z}\n]/gu, ' ');
-}
-function validDate(d) {
-  return typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d);
-}
-
+// ---- EXPORTS ----
 module.exports = {
-  // pg
-  pool,
-  // cors
-  corsHeaders, isAllowedOrigin, handleOptions,
-  // auth
-  requireAdmin,
-  // csrf
-  signCsrf, verifyCsrf,
-  // rate limit
-  rateLimit,
-  // utils
-  safeJson, sanitizeComment, validDate,
+  // PG
+  getPool,
+
+  // CORS
+  corsHeaders,
+
+  // Cookies
+  setCookie,
+  clearCookie,
+  parseCookies,
+
+  // Session
+  signSid,
+  verifySid,
+  createSession,
+  getSession,
+  revokeSession,
+
+  // Rate limit
+  checkAndIncRateLimit,
+
+  // CSRF
+  signCsrf,
+  verifyCsrf,
+
+  // Helpers
+  clientIp,
+  userAgent,
+
+  // bcrypt для login.js
+  bcrypt
 };
