@@ -1,8 +1,7 @@
 const bcrypt = require('bcryptjs');
-const {
-  pool, corsHeaders, setCookie, parseCookies,
-  createSession, checkAndIncRateLimit, clientIp, userAgent
-} = require('./_utils');
+const { getPool, corsHeaders, setCookie, parseCookies, createSession, checkAndIncRateLimit, clientIp, userAgent } = require('./_utils');
+const pool = getPool();
+
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
 const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
