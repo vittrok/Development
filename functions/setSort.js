@@ -9,6 +9,11 @@ const {
   rateLimit,
 } = require('./_utils');
 
+const { requireAuth } = require('./_auth');
+exports.handler = requireAuth(async (event) => {
+  // ... існуюча логіка + перевірка CSRF як і раніше
+});
+
 exports.handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') return handleOptions(event);
   if (!isAllowedOrigin(event)) return { statusCode: 403, body: 'forbidden' };

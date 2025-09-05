@@ -1,4 +1,18 @@
 let CSRF = null; // will store token from getPreferences
+let AUTH = { authenticated: false, role: null };
+
+async function init() {
+  const r = await fetch('/.netlify/functions/me', { credentials: 'include' });
+  const me = await r.json();
+  AUTH = me;
+  if (me.csrf) CSRF = me.csrf;
+  if (!me.authenticated) {
+    // showLoginModal();
+  } else {
+    // load app data ...
+  }
+}
+init();
 
 async function j(url, opts) {
   // automatically inject CSRF token into POST requests
