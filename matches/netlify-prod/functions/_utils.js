@@ -186,12 +186,7 @@ function verifyCsrf(token, bind = {}) {
   return true;
 }
 
-/**
- * requireCsrf(event, opts?) → null | {statusCode, headers, body}
- * opts: { bindIp?: boolean, bindUa?: boolean, ttlMs?: number }
- * За замовчуванням перевіряємо підпис + "свіжість" ts (без прив'язки до IP/UA).
- * Для суворішого режиму передай bindIp:true/bindUa:true.
- */
+/** Мідлвар для CSRF: повертає null або готову 403-відповідь */
 function requireCsrf(event, opts = {}) {
   const headers = event?.headers || {};
   const token = headers['x-csrf'] || headers['X-CSRF'];
@@ -205,6 +200,41 @@ function requireCsrf(event, opts = {}) {
     return { statusCode: 403, headers: corsHeaders(), body: 'forbidden' };
   }
   return null;
+}
+
+// ---- AUTH middlewares ----
+function readSignedSessionCookie(event) {
+  const cookies = parseCookies(event.headers?.cookie || event.headers?.Cookie);
+  return cookies['session'] || null;
+}
+
+/**
+ * requireAuth(event) → { session } | {statusCode,...}
+ * 401 якщо немає чи прострочена сесія.
+ */
+async function requireAuth(event) {
+  const signed = readSignedSessionCookie(event);
+  if (!signed) {
+    return { statusCode: 401, headers: corsHeaders(), body: 'unauthorized' };
+  }
+  const sess = await getSession(signed);
+  if (!sess) {
+    return { statusCode: 401, headers: corsHeaders(), body: 'unauthorized' };
+  }
+  return { session: sess };
+}
+
+/**
+ * requireAdmin(event) → { session } | {statusCode,...}
+ * 401 без сесії; 403 якщо роль != 'admin' (архітектура: адмін-ендпоїнти лише для admin) :contentReference[oaicite:1]{index=1}
+ */
+async function requireAdmin(event) {
+  const res = await requireAuth(event);
+  if (!res.session) return res; // 401
+  if (res.session.role !== 'admin') {
+    return { statusCode: 403, headers: corsHeaders(), body: 'forbidden' };
+  }
+  return res; // { session }
 }
 
 // ---- EXPORTS ----
@@ -234,6 +264,11 @@ module.exports = {
   signCsrf,
   verifyCsrf,
   requireCsrf,
+
+  // AuthZ
+  readSignedSessionCookie,
+  requireAuth,
+  requireAdmin,
 
   // Helpers
   clientIp,
