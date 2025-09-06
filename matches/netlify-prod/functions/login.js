@@ -95,4 +95,74 @@ async function getUserByUsername(username) {
     WHERE username = $1
     LIMIT 1
   `;
-  const { rows } = a
+  const { rows } = await pool.query(q3, [username]);
+  return rows[0] || null;
+}
+
+exports.handler = async (event) => {
+  // CORS preflight
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 204, headers: corsHeaders() };
+  }
+  if (event.httpMethod !== 'POST') {
+    return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
+  }
+
+  try {
+    const body = getJsonBody(event);
+    if (!body || typeof body.username !== 'string' || typeof body.password !== 'string') {
+      return { statusCode: 400, headers: corsHeaders(), body: 'Invalid JSON body' };
+    }
+    const { username, password } = body;
+
+    // 1) Знайти користувача
+    const user = await getUserByUsername(username);
+    if (!user) {
+      return { statusCode: 401, headers: corsHeaders(), body: 'login failed' };
+    }
+
+    // 2) Перевірити пароль: bcrypt → plain → ADMIN_* fallback
+    let ok = false;
+
+    if (!ok && user.password_hash && bcrypt) {
+      try { ok = await bcrypt.compare(password, user.password_hash); } catch {}
+    }
+    if (!ok && user.password) {
+      ok = safeEq(password, user.password);
+    }
+    if (!ok && process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD) {
+      if (safeEq(username, process.env.ADMIN_USERNAME) && safeEq(password, process.env.ADMIN_PASSWORD)) {
+        ok = true;
+      }
+    }
+
+    if (!ok) {
+      return { statusCode: 401, headers: corsHeaders(), body: 'login failed' };
+    }
+
+    // 3) Створити сесію
+    const ttlSeconds = 60 * 60 * 24 * 30; // 30 днів
+    const sess = await createSession({ userId: user.id, role: user.role || 'user', ttlSeconds });
+
+    // 4) Виставити cookie: session=sid.sig
+    const sig = signSid(sess.sid);
+    const cookieVal = encodeURIComponent(`${sess.sid}.${sig}`);
+    const cookie = [
+      `session=${cookieVal}`,
+      'Path=/',
+      'HttpOnly',
+      'Secure',
+      'SameSite=Strict',
+      `Max-Age=${ttlSeconds}`,
+    ].join('; ');
+
+    return {
+      statusCode: 200,
+      headers: { ...corsHeaders(), 'Set-Cookie': cookie, 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ ok: true, role: user.role || 'user' }),
+    };
+  } catch (e) {
+    console.error('[/login] error:', e);
+    return { statusCode: 500, headers: corsHeaders(), body: 'login failed' };
+  }
+};
