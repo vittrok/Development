@@ -1,6 +1,6 @@
 // functions/logout.js
 /* eslint-disable */
-const { corsHeaders, getPool, clientIp, userAgent, verifySigned } = require('./_utils');
+const { corsHeaders, getPool, verifySigned } = require('./_utils');
 
 const pool = getPool();
 
@@ -13,28 +13,28 @@ function extractSid(event) {
 }
 
 function verifyCsrfHeader(event) {
-  const hdr = event.headers?.['x-csrf'] || event.headers?.['X-CSRF'] || event.headers?.['x-csrf'.toLowerCase()];
+  const hdr =
+    event.headers?.['x-csrf'] ||
+    event.headers?.['X-CSRF'] ||
+    event.headers?.['x-csrf'.toLowerCase()];
   if (!hdr || typeof hdr !== 'string') return false;
 
   let payload = null;
   try {
-    // очікуємо формат "base64(payload).signature"
+    // очікуємо формат "base64(payload).signature" (verifySigned з _utils перевіряє HMAC)
     payload = verifySigned(hdr);
   } catch (_) {
-    payload = null;
+    return false;
   }
   if (!payload || typeof payload !== 'object') return false;
 
-  // звіряємо з поточним запитом
-  const ipOk = payload.ip && payload.ip === clientIp(event);
-  const uaOk = payload.ua && payload.ua === userAgent(event);
-  const tsOk = (() => {
-    const MAX_AGE_MS = 1000 * 60 * 60 * 12; // 12 год
-    const t = Number(payload.ts);
-    return Number.isFinite(t) && Math.abs(Date.now() - t) <= MAX_AGE_MS;
-  })();
+  // Перевіряємо лише «свіжість» токена
+  const MAX_AGE_MS = 1000 * 60 * 60 * 12; // 12 год
+  const t = Number(payload.ts);
+  if (!Number.isFinite(t)) return false;
+  if (Math.abs(Date.now() - t) > MAX_AGE_MS) return false;
 
-  return ipOk && uaOk && tsOk;
+  return true;
 }
 
 exports.handler = async (event) => {
