@@ -18,7 +18,7 @@ const pool = new Pool({
 });
 
 // --- CORS ---
-const ORIGIN = "https://football-m.netlify.app"; // твій прод-оригін
+const ORIGIN = "https://football-m.netlify.app"; // прод-оригін
 const corsHeaders = {
   "Access-Control-Allow-Credentials": "true",
   "Access-Control-Allow-Origin": ORIGIN,
@@ -48,6 +48,9 @@ exports.handler = async (event) => {
     const league = normStr(qp.league);
     const team = normStr(qp.team);
 
+    // Новий фільтр: status=scheduled|finished (інші значення ігноруємо)
+    const status = parseStatus(qp.status);
+
     const sort = qp.sort === "kickoff_asc" ? "kickoff_asc" : "kickoff_desc";
 
     // limit: 1..100 (дефолт 50)
@@ -69,17 +72,20 @@ exports.handler = async (event) => {
     }
 
     if (team) {
-      // Використовуємо одне й те саме значення для обох порівнянь
       values.push(team);
       const idx = values.length;
-      // точний матчинг; якщо треба частковий — заміни на ILIKE і %...%
       where.push(`(home_team = $${idx} OR away_team = $${idx})`);
+    }
+
+    if (status) {
+      values.push(status);
+      where.push(`status = $${values.length}`);
     }
 
     const orderBy =
       sort === "kickoff_asc" ? `kickoff_at ASC` : `kickoff_at DESC`;
 
-    // whitelist полів — БЕЗ score-полів
+    // whitelist полів — без score-полів
     let sql = `
       SELECT
         id,
@@ -108,7 +114,7 @@ exports.handler = async (event) => {
 
     const { rows } = await pool.query(sql, values);
 
-    // Додатковий запобіжник (якщо раптом в БД додадуть/повернуть score-поля іншим шляхом)
+    // Додатковий запобіжник — навіть якщо колись з'являться score-поля в SELECT:
     const items = rows.map(({ home_score, away_score, ...rest }) => rest);
 
     return resp(
@@ -119,6 +125,8 @@ exports.handler = async (event) => {
         limit,
         offset,
         sort,
+        // Якщо статус переданий — повернемо його у відповідь як echo
+        ...(status ? { filter: { status } } : {}),
       },
       corsHeaders
     );
@@ -145,4 +153,11 @@ function normStr(x) {
   if (typeof x !== "string") return null;
   const t = x.trim();
   return t.length ? t : null;
+}
+
+function parseStatus(x) {
+  if (typeof x !== "string") return null;
+  const t = x.trim().toLowerCase();
+  if (t === "scheduled" || t === "finished") return t;
+  return null; // невідоме значення ігноруємо
 }
