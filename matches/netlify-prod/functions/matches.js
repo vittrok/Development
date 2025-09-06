@@ -48,9 +48,10 @@ exports.handler = async (event) => {
     const league = normStr(qp.league);
     const team = normStr(qp.team);
 
-    // Новий фільтр: status=scheduled|finished (інші значення ігноруємо)
+    // Фільтр статусу: scheduled|finished (інші ігноруємо)
     const status = parseStatus(qp.status);
 
+    // Сортування: kickoff_asc|kickoff_desc
     const sort = qp.sort === "kickoff_asc" ? "kickoff_asc" : "kickoff_desc";
 
     // limit: 1..100 (дефолт 50)
@@ -82,8 +83,11 @@ exports.handler = async (event) => {
       where.push(`status = $${values.length}`);
     }
 
-    const orderBy =
-      sort === "kickoff_asc" ? `kickoff_at ASC` : `kickoff_at DESC`;
+    // Стабільний tie-breaker (арх. v1.1):
+    // ORDER BY <sort> , kickoff_at DESC, home_team, away_team, id
+    const primarySort =
+      sort === "kickoff_asc" ? "kickoff_at ASC" : "kickoff_at DESC";
+    const orderBy = `${primarySort}, kickoff_at DESC, home_team ASC, away_team ASC, id ASC`;
 
     // whitelist полів — без score-полів
     let sql = `
@@ -114,7 +118,7 @@ exports.handler = async (event) => {
 
     const { rows } = await pool.query(sql, values);
 
-    // Додатковий запобіжник — навіть якщо колись з'являться score-поля в SELECT:
+    // Захист на випадок повернення зайвих полів:
     const items = rows.map(({ home_score, away_score, ...rest }) => rest);
 
     return resp(
@@ -125,7 +129,6 @@ exports.handler = async (event) => {
         limit,
         offset,
         sort,
-        // Якщо статус переданий — повернемо його у відповідь як echo
         ...(status ? { filter: { status } } : {}),
       },
       corsHeaders
@@ -159,5 +162,5 @@ function parseStatus(x) {
   if (typeof x !== "string") return null;
   const t = x.trim().toLowerCase();
   if (t === "scheduled" || t === "finished") return t;
-  return null; // невідоме значення ігноруємо
+  return null;
 }
