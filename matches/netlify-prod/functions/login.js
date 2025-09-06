@@ -1,7 +1,7 @@
 // functions/login.js
 /* eslint-disable */
 const crypto = require('crypto');
-const { corsHeaders, getPool } = require('./_utils');
+const { corsHeaders, getPool, checkAndIncRateLimit, clientIp } = require('./_utils');
 const { createSession } = require('./_session');
 
 const pool = getPool();
@@ -63,32 +63,21 @@ async function findUserRecord(identifier) {
   for (const q of tries) {
     try {
       const { rows } = await pool.query(q, [identifier]);
-      if (rows.length && rows[0].usr) return rows[0].usr; // json → JS object
+      if (rows.length && rows[0].usr) return rows[0].usr;
     } catch (e) {
-      // якщо помилка "невідоме поле" — просто пробуємо наступний варіант
       if (!(e && e.code === '42703')) throw e;
     }
   }
   return null;
 }
-
-/** Витягає id користувача з довільної схеми */
-function pickUserId(u) {
-  return u.id ?? u.user_id ?? u.uid ?? null;
-}
-/** Витягає роль */
-function pickRole(u) {
-  return u.role ?? u.user_role ?? 'user';
-}
-/** Витягає кандидати для пароля (hash/plain) */
+function pickUserId(u) { return u.id ?? u.user_id ?? u.uid ?? null; }
+function pickRole(u)   { return u.role ?? u.user_role ?? 'user'; }
 function pickPasswordCandidates(u) {
   const hashKeys = ['password_hash','pwd_hash','pass_hash','hash','passwordhash'];
   const plainKeys = ['password','pass','pwd'];
   let hash = null, plain = null;
-
   for (const k of hashKeys) if (typeof u[k] === 'string' && u[k]) { hash = u[k]; break; }
   for (const k of plainKeys) if (typeof u[k] === 'string' && u[k]) { plain = u[k]; break; }
-
   return { hash, plain };
 }
 
@@ -108,10 +97,27 @@ exports.handler = async (event) => {
     }
     const { username, password } = body;
 
-    // 1) Знайти запис користувача (jsonb з усіма полями)
+    // === Rate limit: 5 спроб за 15 хв для IP+username ===
+    const ip = clientIp(event);
+    const key = `login:${ip}:${(username || '').toLowerCase()}`;
+    const rl = await checkAndIncRateLimit(key, 5, 15 * 60); // 5/900s
+
+    if (rl.limited) {
+      return {
+        statusCode: 429,
+        headers: { ...corsHeaders(), 'Retry-After': String(rl.retryAfterSec) },
+        body: 'too many attempts',
+      };
+    }
+
+    // 1) Знайти користувача
     const u = await findUserRecord(username);
     if (!u) {
-      return { statusCode: 401, headers: corsHeaders(), body: 'login failed' };
+      return {
+        statusCode: 401,
+        headers: { ...corsHeaders(), 'X-RateLimit-Remaining': String(Math.max(0, rl.remaining)) },
+        body: 'login failed',
+      };
     }
 
     // 2) Перевірити пароль
@@ -130,14 +136,17 @@ exports.handler = async (event) => {
       }
     }
     if (!ok) {
-      return { statusCode: 401, headers: corsHeaders(), body: 'login failed' };
+      return {
+        statusCode: 401,
+        headers: { ...corsHeaders(), 'X-RateLimit-Remaining': String(Math.max(0, rl.remaining)) },
+        body: 'login failed',
+      };
     }
 
     // 3) Створити сесію в БД
     const userId = pickUserId(u);
     const role   = pickRole(u);
     if (!userId) {
-      // без id створити сесію неможливо
       return { statusCode: 500, headers: corsHeaders(), body: 'login failed' };
     }
 
