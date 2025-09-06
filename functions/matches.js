@@ -1,109 +1,148 @@
-// functions/matches.js
-/* eslint-disable */
-const { corsHeaders, getPool } = require('./_utils');
+// matches/netlify-prod/functions/matches.js
 
-const pool = getPool();
+const { Pool } = require("pg");
 
-function parseList(val) {
-  if (!val) return null;
-  if (Array.isArray(val)) return val;
-  return String(val)
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+// --- DB connection ---
+const connectionString =
+  process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
+
+if (!connectionString) {
+  console.warn(
+    "[matches] Missing DATABASE_URL/NEON_DATABASE_URL. Set it in Netlify env."
+  );
 }
 
+const pool = new Pool({
+  connectionString,
+  ssl: { rejectUnauthorized: false }, // Neon/managed PG зазвичай вимагає SSL
+});
+
+// --- CORS ---
+const ORIGIN = "https://football-m.netlify.app"; // твій прод-оригін
+const corsHeaders = {
+  "Access-Control-Allow-Credentials": "true",
+  "Access-Control-Allow-Origin": ORIGIN,
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-Requested-With, X-CSRF",
+  "Content-Type": "application/json; charset=utf-8",
+  "Cache-Control": "no-cache",
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+};
+
 exports.handler = async (event) => {
-  // CORS preflight
-  if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: corsHeaders() };
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 200, headers: corsHeaders, body: "" };
   }
 
-  if (event.httpMethod !== 'GET') {
-    return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
+  if (event.httpMethod !== "GET") {
+    return resp(
+      405,
+      { ok: false, error: "Method Not Allowed" },
+      corsHeaders
+    );
   }
 
   try {
-    const qs = event.queryStringParameters || {};
+    const qp = event.queryStringParameters || {};
 
-    // фільтри
-    const dateFrom = qs.date_from || null; // ISO-строка
-    const dateTo   = qs.date_to   || null;
+    const league = normStr(qp.league);
+    const team = normStr(qp.team);
 
-    const leagues  = parseList(qs.league);
-    const statuses = parseList(qs.status);
+    const sort = qp.sort === "kickoff_asc" ? "kickoff_asc" : "kickoff_desc";
 
-    const teamLike = qs.team ? String(qs.team).trim() : null;
-    const q        = qs.q    ? String(qs.q).trim()    : null;
+    // limit: 1..100 (дефолт 50)
+    let limit = parseInt(qp.limit, 10);
+    if (!Number.isFinite(limit)) limit = 50;
+    limit = Math.max(1, Math.min(100, limit));
 
-    // пагінація/сорт
-    let limit = Number.parseInt(qs.limit, 10);
-    if (!Number.isFinite(limit) || limit <= 0) limit = 20;
-    if (limit > 100) limit = 100;
-
-    let offset = Number.parseInt(qs.offset, 10);
+    // offset: 0..∞
+    let offset = parseInt(qp.offset, 10);
     if (!Number.isFinite(offset) || offset < 0) offset = 0;
 
-    const sort = (qs.sort || 'kickoff_asc').toLowerCase();
-    const orderBy = sort === 'kickoff_desc'
-      ? 'kickoff_at DESC, id DESC'
-      : 'kickoff_at ASC, id ASC';
-
-    // WHERE
+    // --- build SQL ---
     const where = [];
-    const params = [];
+    const values = [];
 
-    if (dateFrom) {
-      params.push(dateFrom);
-      where.push(`kickoff_at >= $${params.length}`);
-    }
-    if (dateTo) {
-      params.push(dateTo);
-      where.push(`kickoff_at <= $${params.length}`);
-    }
-    if (leagues && leagues.length) {
-      params.push(leagues);
-      where.push(`league = ANY($${params.length})`);
-    }
-    if (statuses && statuses.length) {
-      params.push(statuses);
-      where.push(`status = ANY($${params.length})`);
-    }
-    if (teamLike) {
-      params.push(`%${teamLike}%`);
-      params.push(`%${teamLike}%`);
-      where.push(`(home_team ILIKE $${params.length - 1} OR away_team ILIKE $${params.length})`);
-    }
-    if (q) {
-      params.push(`%${q}%`);
-      params.push(`%${q}%`);
-      params.push(`%${q}%`);
-      where.push(`(league ILIKE $${params.length - 2} OR home_team ILIKE $${params.length - 1} OR away_team ILIKE $${params.length})`);
+    if (league) {
+      values.push(league);
+      where.push(`league = $${values.length}`);
     }
 
-    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    if (team) {
+      // Використовуємо одне й те саме значення для обох порівнянь
+      values.push(team);
+      const idx = values.length;
+      // точний матчинг; якщо треба частковий — заміни на ILIKE і %...%
+      where.push(`(home_team = $${idx} OR away_team = $${idx})`);
+    }
 
-    params.push(limit);
-    params.push(offset);
+    const orderBy =
+      sort === "kickoff_asc" ? `kickoff_at ASC` : `kickoff_at DESC`;
 
-    const sql = `
-      SELECT id, kickoff_at, league, home_team, away_team, status,
-             home_score, away_score, venue, metadata, created_at, updated_at
+    // whitelist полів — БЕЗ score-полів
+    let sql = `
+      SELECT
+        id,
+        kickoff_at,
+        league,
+        home_team,
+        away_team,
+        status,
+        venue,
+        COALESCE(metadata, '{}'::jsonb) AS metadata,
+        created_at,
+        updated_at
       FROM matches
-      ${whereSql}
-      ORDER BY ${orderBy}
-      LIMIT $${params.length - 1} OFFSET $${params.length}
     `;
 
-    const { rows } = await pool.query(sql, params);
+    if (where.length) {
+      sql += ` WHERE ${where.join(" AND ")} `;
+    }
 
-    return {
-      statusCode: 200,
-      headers: { ...corsHeaders(), 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({ ok: true, items: rows, limit, offset, sort }),
-    };
-  } catch (e) {
-    console.error('[/matches GET] error:', e);
-    return { statusCode: 500, headers: corsHeaders(), body: 'matches failed' };
+    values.push(limit);
+    const limitIdx = values.length;
+    values.push(offset);
+    const offsetIdx = values.length;
+
+    sql += ` ORDER BY ${orderBy} LIMIT $${limitIdx} OFFSET $${offsetIdx} `;
+
+    const { rows } = await pool.query(sql, values);
+
+    // Додатковий запобіжник (якщо раптом в БД додадуть/повернуть score-поля іншим шляхом)
+    const items = rows.map(({ home_score, away_score, ...rest }) => rest);
+
+    return resp(
+      200,
+      {
+        ok: true,
+        items,
+        limit,
+        offset,
+        sort,
+      },
+      corsHeaders
+    );
+  } catch (err) {
+    console.error("[matches] Error:", err);
+    return resp(
+      500,
+      { ok: false, error: "Internal Server Error" },
+      corsHeaders
+    );
   }
 };
+
+// --- helpers ---
+function resp(statusCode, body, headers) {
+  return {
+    statusCode,
+    headers,
+    body: JSON.stringify(body),
+  };
+}
+
+function normStr(x) {
+  if (typeof x !== "string") return null;
+  const t = x.trim();
+  return t.length ? t : null;
+}
