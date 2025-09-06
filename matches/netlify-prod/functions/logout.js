@@ -13,68 +13,81 @@ function extractSid(event) {
   return String(signed).split('.')[0] || null; // "sid.sig" -> "sid"
 }
 
+// --- CSRF helpers ---
 function b64urlToBuf(s) {
-  // допускаємо як base64url, так і звичайний base64
   s = String(s).replace(/-/g, '+').replace(/_/g, '/');
-  // паддінг
   while (s.length % 4) s += '=';
   return Buffer.from(s, 'base64');
 }
-
+function toB64Url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
 function tsFresh(ts, maxAgeMs = 1000 * 60 * 60 * 12) {
   const t = Number(ts);
   return Number.isFinite(t) && Math.abs(Date.now() - t) <= maxAgeMs;
 }
-
 function pickSecrets() {
   const cands = [
     process.env.CSRF_SECRET,
+    process.env.CSRF_TOKEN_SECRET,
     process.env.SESSION_SECRET,
     process.env.JWT_SECRET,
-    process.env.CSRF_TOKEN_SECRET,
   ].filter(Boolean);
-  // fallback для деву
   return cands.length ? cands : ['dev-secret'];
 }
-
-function hmac256Base64Url(key, data) {
-  return crypto.createHmac('sha256', key).update(data).digest('base64url');
+function tsecEq(a, b) {
+  const A = Buffer.from(String(a), 'utf8');
+  const B = Buffer.from(String(b), 'utf8');
+  return A.length === B.length && crypto.timingSafeEqual(A, B);
 }
 
-/** Перевіряємо формат "<payload>.<sig>", підпис (будь-яким із відомих секретів) і свіжість ts */
+/**
+ * Перевірка X-CSRF, сумісна з різними реалізаціями signCsrf:
+ * очікує "<payload>.<sig>", де payload = base64url(JSON).
+ * Перевіряє HMAC підпис для 3 варіантів вхідних даних:
+ *  1) base64url(payload) як є
+ *  2) сирий JSON (decode(payload))
+ *  3) нормалізований JSON (JSON.stringify(JSON.parse(raw)))
+ */
 function verifyCsrfHeader(event) {
-  const hdr =
-    event.headers?.['x-csrf'] ||
-    event.headers?.['X-CSRF'] ||
-    event.headers?.['x-csrf'.toLowerCase()];
+  const hdr = event.headers?.['x-csrf'] || event.headers?.['X-CSRF'];
   if (!hdr || typeof hdr !== 'string') return false;
 
   const parts = hdr.split('.');
   if (parts.length !== 2) return false;
   const [payloadPart, sigPart] = parts;
 
-  let payloadObj = null;
+  let rawJson;
   try {
-    const json = b64urlToBuf(payloadPart).toString('utf8');
-    payloadObj = JSON.parse(json);
+    rawJson = b64urlToBuf(payloadPart).toString('utf8');
   } catch {
     return false;
   }
-  if (!payloadObj || !tsFresh(payloadObj.ts)) return false;
+  let obj;
+  try { obj = JSON.parse(rawJson); } catch { return false; }
+  if (!obj || !tsFresh(obj.ts)) return false;
 
-  const expectedMatches = pickSecrets().some((sec) => {
-    const calc = hmac256Base64Url(sec, payloadPart);
-    try {
-      // захист від побічних каналів
-      const a = Buffer.from(calc, 'utf8');
-      const b = Buffer.from(sigPart, 'utf8');
-      return a.length === b.length && crypto.timingSafeEqual(a, b);
-    } catch {
-      return false;
+  const normalizedJson = (() => {
+    try { return JSON.stringify(obj); } catch { return null; }
+  })();
+
+  const secrets = pickSecrets();
+  for (const sec of secrets) {
+    // варіант A: HMAC(base64url(payload))
+    const sigA = toB64Url(crypto.createHmac('sha256', sec).update(payloadPart).digest());
+    if (tsecEq(sigA, sigPart)) return true;
+
+    // варіант B: HMAC(raw JSON)
+    const sigB = toB64Url(crypto.createHmac('sha256', sec).update(rawJson).digest());
+    if (tsecEq(sigB, sigPart)) return true;
+
+    // варіант C: HMAC(normalized JSON)
+    if (normalizedJson) {
+      const sigC = toB64Url(crypto.createHmac('sha256', sec).update(normalizedJson).digest());
+      if (tsecEq(sigC, sigPart)) return true;
     }
-  });
-
-  return expectedMatches;
+  }
+  return false;
 }
 
 exports.handler = async (event) => {
@@ -82,7 +95,6 @@ exports.handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers: corsHeaders() };
   }
-
   if (event.httpMethod !== 'POST') {
     return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
   }
@@ -97,7 +109,7 @@ exports.handler = async (event) => {
       await pool.query(`UPDATE sessions SET revoked = true WHERE sid = $1`, [sid]);
     }
 
-    // Затираємо cookie
+    // гасимо cookie
     const cookie = [
       'session=;',
       'Path=/',
