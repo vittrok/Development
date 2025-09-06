@@ -56,4 +56,68 @@ try { bcrypt = require('bcryptjs'); } catch (_) {
 exports.handler = async (event) => {
   // CORS preflight
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, he
+    return { statusCode: 204, headers: corsHeaders() };
+  }
+
+  if (event.httpMethod !== 'POST') {
+    return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
+  }
+
+  try {
+    const body = getJsonBody(event);
+    if (!body || typeof body.username !== 'string' || typeof body.password !== 'string') {
+      return { statusCode: 400, headers: corsHeaders(), body: 'Invalid JSON body' };
+    }
+    const { username, password } = body;
+
+    // 1) Знаходимо користувача
+    const q = `
+      SELECT id, username, role, password_hash, password
+      FROM users
+      WHERE username = $1
+      LIMIT 1
+    `;
+    const { rows } = await pool.query(q, [username]);
+    if (!rows.length) {
+      return { statusCode: 401, headers: corsHeaders(), body: 'login failed' };
+    }
+    const user = rows[0];
+
+    // 2) Перевіряємо пароль
+    let ok = false;
+    if (user.password_hash && bcrypt) {
+      try { ok = await bcrypt.compare(password, user.password_hash); } catch (_) { ok = false; }
+    }
+    if (!ok && user.password) {
+      ok = safeEq(password, user.password); // fallback на колонку password (якщо є)
+    }
+    if (!ok) {
+      return { statusCode: 401, headers: corsHeaders(), body: 'login failed' };
+    }
+
+    // 3) Створюємо сесію в БД
+    const ttlSeconds = 60 * 60 * 24 * 30; // 30 днів
+    const sess = await createSession({ userId: user.id, role: user.role || 'user', ttlSeconds });
+
+    // 4) Ставимо cookie session=sid.sig (першу частину sid читатиме /me)
+    const sig = signSid(sess.sid);
+    const cookieVal = encodeURIComponent(`${sess.sid}.${sig}`);
+    const cookie = [
+      `session=${cookieVal}`,
+      'Path=/',
+      'HttpOnly',
+      'Secure',
+      'SameSite=Strict',
+      `Max-Age=${ttlSeconds}`,
+    ].join('; ');
+
+    return {
+      statusCode: 200,
+      headers: { ...corsHeaders(), 'Set-Cookie': cookie },
+      body: JSON.stringify({ ok: true, role: user.role || 'user' }),
+    };
+  } catch (e) {
+    console.error('[/login] error:', e);
+    return { statusCode: 500, headers: corsHeaders(), body: 'login failed' };
+  }
+};
