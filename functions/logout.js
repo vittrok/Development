@@ -1,6 +1,6 @@
 // functions/logout.js
 /* eslint-disable */
-const { corsHeaders, getPool, requireCsrf } = require('./_utils');
+const { corsHeaders, getPool, requireAuth, requireCsrf } = require('./_utils');
 
 const pool = getPool();
 
@@ -21,17 +21,22 @@ exports.handler = async (event) => {
     return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
   }
 
-  // Уніфікована перевірка CSRF
-  const deny = requireCsrf(event); // за замовчуванням: підпис + свіжість ts
+  // 1) Вимагаємо активну сесію (401 якщо немає/прострочена/відrevoke’на)
+  const auth = await requireAuth(event);
+  if (!auth.session) return auth; // тут уже готова 401-відповідь
+
+  // 2) CSRF (403 без валідного X-CSRF)
+  const deny = requireCsrf(event);
   if (deny) return deny;
 
   try {
+    // 3) Відкликання поточної сесії
     const sid = extractSid(event);
     if (sid) {
       await pool.query(`UPDATE sessions SET revoked = true WHERE sid = $1`, [sid]);
     }
 
-    // Гасимо cookie
+    // 4) Гасимо cookie
     const cookie = [
       'session=;',
       'Path=/',
