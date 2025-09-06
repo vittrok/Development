@@ -186,6 +186,27 @@ function verifyCsrf(token, bind = {}) {
   return true;
 }
 
+/**
+ * requireCsrf(event, opts?) → null | {statusCode, headers, body}
+ * opts: { bindIp?: boolean, bindUa?: boolean, ttlMs?: number }
+ * За замовчуванням перевіряємо підпис + "свіжість" ts (без прив'язки до IP/UA).
+ * Для суворішого режиму передай bindIp:true/bindUa:true.
+ */
+function requireCsrf(event, opts = {}) {
+  const headers = event?.headers || {};
+  const token = headers['x-csrf'] || headers['X-CSRF'];
+  const bind = {};
+  if (opts.bindIp) bind.ip = clientIp(event);
+  if (opts.bindUa) bind.ua = userAgent(event);
+  if (typeof opts.ttlMs === 'number') bind.ttlMs = opts.ttlMs;
+
+  const ok = verifyCsrf(token, bind);
+  if (!ok) {
+    return { statusCode: 403, headers: corsHeaders(), body: 'forbidden' };
+  }
+  return null;
+}
+
 // ---- EXPORTS ----
 module.exports = {
   // PG
@@ -212,6 +233,7 @@ module.exports = {
   // CSRF
   signCsrf,
   verifyCsrf,
+  requireCsrf,
 
   // Helpers
   clientIp,
