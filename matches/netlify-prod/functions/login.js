@@ -1,69 +1,59 @@
-const bcrypt = require('bcryptjs');
-const { getPool, corsHeaders, setCookie, parseCookies, createSession, checkAndIncRateLimit, clientIp, userAgent } = require('./_utils');
+// functions/login.js
+/* eslint-disable */
+const crypto = require('crypto');
+const { corsHeaders } = require('./_utils');
+const { getPool } = require('./_utils');
+const { createSession } = require('./_session');
+
 const pool = getPool();
 
+/** Надійний парсер body (JSON, base64, x-www-form-urlencoded) */
+function getJsonBody(event) {
+  if (!event) return null;
+  let raw = event.body;
 
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
-const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
+  // Netlify може ставити isBase64Encoded
+  if (event.isBase64Encoded && typeof raw === 'string') {
+    try { raw = Buffer.from(raw, 'base64').toString('utf8'); } catch (_) {}
+  }
+
+  if (raw && typeof raw === 'object') return raw; // dev/локально
+  if (typeof raw !== 'string') return null;
+
+  raw = raw.trim();
+  const ct = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
+
+  if (ct.includes('application/x-www-form-urlencoded')) {
+    const params = new URLSearchParams(raw);
+    const obj = {};
+    for (const [k, v] of params) obj[k] = v;
+    return obj;
+  }
+
+  return JSON.parse(raw);
+}
+
+/** Підписуємо sid для cookie "session=sid.sig" */
+function signSid(sid) {
+  const secret = process.env.SESSION_SECRET || process.env.JWT_SECRET || 'dev-secret';
+  return crypto.createHmac('sha256', secret).update(String(sid)).digest('base64url');
+}
+
+/** Безпечне порівняння рядків (для fallback plain-text) */
+function safeEq(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const aBuf = Buffer.from(a, 'utf8');
+  const bBuf = Buffer.from(b, 'utf8');
+  if (aBuf.length !== bBuf.length) return false;
+  try { return crypto.timingSafeEqual(aBuf, bBuf); } catch { return false; }
+}
+
+let bcrypt = null;
+try { bcrypt = require('bcryptjs'); } catch (_) {
+  try { bcrypt = require('bcrypt'); } catch (_) { bcrypt = null; }
+}
 
 exports.handler = async (event) => {
+  // CORS preflight
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: corsHeaders() };
-  }
-  if (event.httpMethod !== 'POST') {
-    return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
-  }
-
-  try {
-    // rate-limit на логін: ip + глобальний
-    const ip = clientIp(event);
-    const { limited, retryAfterSec } = await checkAndIncRateLimit(`ip:${ip}:login`, 5, 10 * 60);
-    if (limited) {
-      return { statusCode: 429, headers: { ...corsHeaders(), 'Retry-After': String(retryAfterSec) }, body: 'Too Many' };
-    }
-
-    const body = event.body ? JSON.parse(event.body) : {};
-    const { username, password } = body || {};
-    if (!username || !password) {
-      return { statusCode: 400, headers: corsHeaders(), body: 'username/password required' };
-    }
-
-    // lazy-seed admin user якщо не існує
-    let { rows } = await pool.query('SELECT id, username, password_hash, role FROM users WHERE username=$1', [ADMIN_USERNAME]);
-    if (!rows.length) {
-      if (username !== ADMIN_USERNAME) {
-        return { statusCode: 401, headers: corsHeaders(), body: 'bad creds' };
-      }
-      if (!ADMIN_PASSWORD_HASH) {
-        return { statusCode: 500, headers: corsHeaders(), body: 'ADMIN_PASSWORD_HASH not set' };
-      }
-      await pool.query(
-        'INSERT INTO users(username, password_hash, role) VALUES ($1,$2,$3)',
-        [ADMIN_USERNAME, ADMIN_PASSWORD_HASH, 'admin']
-      );
-      rows = (await pool.query('SELECT id, username, password_hash, role FROM users WHERE username=$1', [ADMIN_USERNAME])).rows;
-    }
-
-    const user = rows[0];
-    if (username !== user.username) {
-      return { statusCode: 401, headers: corsHeaders(), body: 'bad creds' };
-    }
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) {
-      return { statusCode: 401, headers: corsHeaders(), body: 'bad creds' };
-    }
-
-    // створюємо сесію
-    const signed = await createSession(user.id, 30);
-    await pool.query('UPDATE users SET last_login_at=now() WHERE id=$1', [user.id]);
-
-    return {
-      statusCode: 200,
-      headers: { ...corsHeaders(), 'Set-Cookie': setCookie('session', signed) },
-      body: JSON.stringify({ ok: true })
-    };
-  } catch (e) {
-    console.error(e);
-    return { statusCode: 500, headers: corsHeaders(), body: 'login failed' };
-  }
-};
+    return { statusCode: 204, he
