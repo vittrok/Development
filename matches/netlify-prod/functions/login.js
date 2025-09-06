@@ -18,26 +18,22 @@ function getJsonBody(event) {
   if (!event) return null;
   let raw = event.body;
 
-  // Netlify інколи ставить isBase64Encoded=true
   if (event.isBase64Encoded && typeof raw === 'string') {
     try { raw = Buffer.from(raw, 'base64').toString('utf8'); } catch {}
   }
-  if (raw && typeof raw === 'object') return raw; // локальні дев-сценарії
+  if (raw && typeof raw === 'object') return raw;
   if (typeof raw !== 'string') return null;
 
   raw = raw.trim();
   const ct = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
 
-  // 1) form-urlencoded або вигляд a=b&c=d
   if (ct.includes('application/x-www-form-urlencoded') || (!raw.startsWith('{') && raw.includes('='))) {
     return fromUrlEncoded(raw);
   }
 
-  // 2) чистий JSON
   const obj = tryParseJSON(raw);
   if (obj) return obj;
 
-  // 3) нічого не вийшло
   return null;
 }
 /* ------------------------------------------------------------- */
@@ -57,46 +53,43 @@ function safeEq(a, b) {
 let bcrypt = null;
 try { bcrypt = require('bcryptjs'); } catch { try { bcrypt = require('bcrypt'); } catch { bcrypt = null; } }
 
-/** Гнучке діставання користувача з різними схемами колонок */
-async function getUserByUsername(username) {
-  // варіант 1: password_hash + password
-  const q1 = `
-    SELECT id, username, role, password_hash, password
-    FROM users
-    WHERE username = $1
-    LIMIT 1
-  `;
-  try {
-    const { rows } = await pool.query(q1, [username]);
-    if (rows.length) return rows[0];
-  } catch (e) {
-    // якщо undefined_column (42703) — спробуємо інший запит
-    if (e && e.code !== '42703') throw e;
+/** Пробує знайти користувача по username → login → email. Повертає об’єкт із УСІМА полями (jsonb). */
+async function findUserRecord(identifier) {
+  const tries = [
+    `SELECT to_jsonb(u) AS usr FROM users u WHERE u.username = $1 LIMIT 1`,
+    `SELECT to_jsonb(u) AS usr FROM users u WHERE u.login    = $1 LIMIT 1`,
+    `SELECT to_jsonb(u) AS usr FROM users u WHERE u.email    = $1 LIMIT 1`,
+  ];
+  for (const q of tries) {
+    try {
+      const { rows } = await pool.query(q, [identifier]);
+      if (rows.length && rows[0].usr) return rows[0].usr; // json → JS object
+    } catch (e) {
+      // якщо помилка "невідоме поле" — просто пробуємо наступний варіант
+      if (!(e && e.code === '42703')) throw e;
+    }
   }
+  return null;
+}
 
-  // варіант 2: тільки password (plain)
-  const q2 = `
-    SELECT id, username, role, password
-    FROM users
-    WHERE username = $1
-    LIMIT 1
-  `;
-  try {
-    const { rows } = await pool.query(q2, [username]);
-    if (rows.length) return rows[0];
-  } catch (e) {
-    if (e && e.code !== '42703') throw e;
-  }
+/** Витягає id користувача з довільної схеми */
+function pickUserId(u) {
+  return u.id ?? u.user_id ?? u.uid ?? null;
+}
+/** Витягає роль */
+function pickRole(u) {
+  return u.role ?? u.user_role ?? 'user';
+}
+/** Витягає кандидати для пароля (hash/plain) */
+function pickPasswordCandidates(u) {
+  const hashKeys = ['password_hash','pwd_hash','pass_hash','hash','passwordhash'];
+  const plainKeys = ['password','pass','pwd'];
+  let hash = null, plain = null;
 
-  // варіант 3: без пароля (дозволить fallback на ADMIN_* env)
-  const q3 = `
-    SELECT id, username, role
-    FROM users
-    WHERE username = $1
-    LIMIT 1
-  `;
-  const { rows } = await pool.query(q3, [username]);
-  return rows[0] || null;
+  for (const k of hashKeys) if (typeof u[k] === 'string' && u[k]) { hash = u[k]; break; }
+  for (const k of plainKeys) if (typeof u[k] === 'string' && u[k]) { plain = u[k]; break; }
+
+  return { hash, plain };
 }
 
 exports.handler = async (event) => {
@@ -115,36 +108,43 @@ exports.handler = async (event) => {
     }
     const { username, password } = body;
 
-    // 1) Знайти користувача
-    const user = await getUserByUsername(username);
-    if (!user) {
+    // 1) Знайти запис користувача (jsonb з усіма полями)
+    const u = await findUserRecord(username);
+    if (!u) {
       return { statusCode: 401, headers: corsHeaders(), body: 'login failed' };
     }
 
-    // 2) Перевірити пароль: bcrypt → plain → ADMIN_* fallback
+    // 2) Перевірити пароль
+    const { hash, plain } = pickPasswordCandidates(u);
     let ok = false;
 
-    if (!ok && user.password_hash && bcrypt) {
-      try { ok = await bcrypt.compare(password, user.password_hash); } catch {}
+    if (!ok && hash && bcrypt) {
+      try { ok = await bcrypt.compare(password, hash); } catch {}
     }
-    if (!ok && user.password) {
-      ok = safeEq(password, user.password);
+    if (!ok && plain) {
+      ok = safeEq(password, plain);
     }
     if (!ok && process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD) {
       if (safeEq(username, process.env.ADMIN_USERNAME) && safeEq(password, process.env.ADMIN_PASSWORD)) {
         ok = true;
       }
     }
-
     if (!ok) {
       return { statusCode: 401, headers: corsHeaders(), body: 'login failed' };
     }
 
-    // 3) Створити сесію
-    const ttlSeconds = 60 * 60 * 24 * 30; // 30 днів
-    const sess = await createSession({ userId: user.id, role: user.role || 'user', ttlSeconds });
+    // 3) Створити сесію в БД
+    const userId = pickUserId(u);
+    const role   = pickRole(u);
+    if (!userId) {
+      // без id створити сесію неможливо
+      return { statusCode: 500, headers: corsHeaders(), body: 'login failed' };
+    }
 
-    // 4) Виставити cookie: session=sid.sig
+    const ttlSeconds = 60 * 60 * 24 * 30; // 30 днів
+    const sess = await createSession({ userId, role, ttlSeconds });
+
+    // 4) Cookie session=sid.sig
     const sig = signSid(sess.sid);
     const cookieVal = encodeURIComponent(`${sess.sid}.${sig}`);
     const cookie = [
@@ -159,7 +159,7 @@ exports.handler = async (event) => {
     return {
       statusCode: 200,
       headers: { ...corsHeaders(), 'Set-Cookie': cookie, 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({ ok: true, role: user.role || 'user' }),
+      body: JSON.stringify({ ok: true, role }),
     };
   } catch (e) {
     console.error('[/login] error:', e);
