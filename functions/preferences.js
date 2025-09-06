@@ -4,7 +4,7 @@ const { corsHeaders, getPool, requireAuth, requireCsrf } = require('./_utils');
 
 const pool = getPool();
 
-/* --- простий парсер body (JSON або x-www-form-urlencoded) --- */
+/* -------------------- robust body parsing (як у login.js) -------------------- */
 function tryParseJSON(s) { try { return JSON.parse(s); } catch { return null; } }
 function fromUrlEncoded(raw) {
   const params = new URLSearchParams(String(raw).replace(/^\?/, ''));
@@ -16,24 +16,29 @@ function getJsonBody(event) {
   if (!event) return null;
   let raw = event.body;
 
+  // Netlify іноді ставить isBase64Encoded=true
   if (event.isBase64Encoded && typeof raw === 'string') {
     try { raw = Buffer.from(raw, 'base64').toString('utf8'); } catch {}
   }
-  if (raw && typeof raw === 'object') return raw;
+  if (raw && typeof raw === 'object') return raw; // локальний дев
   if (typeof raw !== 'string') return null;
 
   raw = raw.trim();
   const ct = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
 
+  // 1) form-urlencoded або вигляд a=b&c=d
   if (ct.includes('application/x-www-form-urlencoded') || (!raw.startsWith('{') && raw.includes('='))) {
     return fromUrlEncoded(raw);
   }
 
+  // 2) чистий JSON
   const obj = tryParseJSON(raw);
   if (obj) return obj;
 
+  // 3) нічого не вийшло
   return null;
 }
+/* --------------------------------------------------------------------------- */
 
 exports.handler = async (event) => {
   // CORS preflight
