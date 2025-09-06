@@ -4,39 +4,64 @@ const { corsHeaders, getPool, requireAuth, requireCsrf } = require('./_utils');
 
 const pool = getPool();
 
-/* -------------------- robust body parsing (як у login.js) -------------------- */
+/* -------------------- robust body parsing -------------------- */
 function tryParseJSON(s) { try { return JSON.parse(s); } catch { return null; } }
+
 function fromUrlEncoded(raw) {
   const params = new URLSearchParams(String(raw).replace(/^\?/, ''));
   const obj = {};
   for (const [k, v] of params) obj[k] = v;
   return obj;
 }
-function getJsonBody(event) {
-  if (!event) return null;
+
+// якщо base64: спершу utf8, якщо є NUL-символи — utf16le
+function decodeMaybeBase64(event) {
   let raw = event.body;
-
-  // Netlify іноді ставить isBase64Encoded=true
-  if (event.isBase64Encoded && typeof raw === 'string') {
-    try { raw = Buffer.from(raw, 'base64').toString('utf8'); } catch {}
+  if (event?.isBase64Encoded && typeof raw === 'string') {
+    const buf = Buffer.from(raw, 'base64');
+    let s = buf.toString('utf8');
+    if (s.includes('\u0000')) s = buf.toString('utf16le');
+    return s;
   }
-  if (raw && typeof raw === 'object') return raw; // локальний дев
-  if (typeof raw !== 'string') return null;
+  if (typeof raw === 'string') return raw;
+  if (raw && typeof raw === 'object') return JSON.stringify(raw);
+  return '';
+}
 
-  raw = raw.trim();
+// для form-urlencoded: якщо значення виглядає як JSON — парсимо
+function coerceJsonish(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (typeof v === 'string') {
+      const t = v.trim();
+      if ((t.startsWith('{') && t.endsWith('}')) || (t.startsWith('[') && t.endsWith(']'))) {
+        const parsed = tryParseJSON(t);
+        out[k] = parsed !== null ? parsed : v;
+      } else {
+        out[k] = v;
+      }
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function getJsonBody(event) {
+  const raw = decodeMaybeBase64(event).trim();
   const ct = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
 
-  // 1) form-urlencoded або вигляд a=b&c=d
+  // form-urlencoded або вигляд a=b&c=d
   if (ct.includes('application/x-www-form-urlencoded') || (!raw.startsWith('{') && raw.includes('='))) {
-    return fromUrlEncoded(raw);
+    return coerceJsonish(fromUrlEncoded(raw));
   }
 
-  // 2) чистий JSON
-  const obj = tryParseJSON(raw);
-  if (obj) return obj;
+  // чистий JSON (спроба напряму, а потім на випадок percent-encoding)
+  return tryParseJSON(raw) || tryParseJSON(decodeURIComponentSafe(raw));
+}
 
-  // 3) нічого не вийшло
-  return null;
+function decodeURIComponentSafe(s) {
+  try { return decodeURIComponent(s); } catch { return s; }
 }
 /* --------------------------------------------------------------------------- */
 
@@ -70,7 +95,7 @@ exports.handler = async (event) => {
     }
 
     if (event.httpMethod === 'POST') {
-      // CSRF обов'язковий для модифікації
+      // CSRF обов'язковий
       const deny = requireCsrf(event);
       if (deny) return deny;
 
