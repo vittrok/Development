@@ -10,27 +10,33 @@ const {
   APP_ORIGIN,
   DATABASE_URL,
   SESSION_SECRET,
-  CSRF_SECRET
+  CSRF_SECRET,
+  CSRF_TTL_MS,            // нове: TTL для CSRF у мс (опц.)
+  CONTEXT                 // Netlify: 'production' | 'deploy-preview' | 'branch-deploy' | ...
 } = process.env;
 
 if (!DATABASE_URL) throw new Error('DATABASE_URL is not set');
 if (!SESSION_SECRET) throw new Error('SESSION_SECRET is not set');
 if (!CSRF_SECRET) throw new Error('CSRF_SECRET is not set');
+// У проді APP_ORIGIN обов’язковий (у прев’ю/бранчах — не валимо білд)
+if ((CONTEXT === 'production') && !APP_ORIGIN) {
+  throw new Error('APP_ORIGIN is not set (required in production)');
+}
 
 // ---- PG POOL (singleton) ----
 let _pool = null;
 function getPool() {
   if (!_pool) {
-    const { Pool } = require('pg');
     _pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false }  // <— важливо для Neon/Supabase
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false }  // Neon/Supabase
     });
   }
   return _pool;
 }
 
 // ---- CORS ----
+// Єдиний легальний origin — APP_ORIGIN (забезпеч його в Netlify env).
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': APP_ORIGIN || 'https://example.com',
@@ -43,10 +49,10 @@ function corsHeaders() {
 
 // ---- COOKIES ----
 function setCookie(name, value, { maxAgeSec = 60 * 60 * 24 * 30 } = {}) {
-  return `${name}=${encodeURIComponent(value)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}`;
+  return `${name}=${encodeURIComponent(value)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAgeSec}`;
 }
 function clearCookie(name) {
-  return `${name}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
+  return `${name}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
 }
 function parseCookies(header) {
   const out = {};
@@ -62,10 +68,10 @@ function parseCookies(header) {
 
 // ---- HELPERS (IP/UA) ----
 function clientIp(event) {
-  return (event.headers['x-forwarded-for'] || '').split(',')[0]?.trim() || 'ip:unknown';
+  return (event.headers?.['x-forwarded-for'] || '').split(',')[0]?.trim() || 'ip:unknown';
 }
 function userAgent(event) {
-  return event.headers['user-agent'] || 'ua:unknown';
+  return event.headers?.['user-agent'] || 'ua:unknown';
 }
 
 // ---- SESSIONS (cookie: "session" = "<sid>.<sig>") ----
@@ -190,10 +196,16 @@ function verifyCsrf(token, bind = {}) {
 function requireCsrf(event, opts = {}) {
   const headers = event?.headers || {};
   const token = headers['x-csrf'] || headers['X-CSRF'];
+
   const bind = {};
   if (opts.bindIp) bind.ip = clientIp(event);
   if (opts.bindUa) bind.ua = userAgent(event);
-  if (typeof opts.ttlMs === 'number') bind.ttlMs = opts.ttlMs;
+
+  // нове: TTL із env за замовчуванням
+  const envTtl = Number(CSRF_TTL_MS);
+  bind.ttlMs = typeof opts.ttlMs === 'number'
+    ? opts.ttlMs
+    : (Number.isFinite(envTtl) && envTtl > 0 ? envTtl : undefined);
 
   const ok = verifyCsrf(token, bind);
   if (!ok) {
@@ -208,10 +220,7 @@ function readSignedSessionCookie(event) {
   return cookies['session'] || null;
 }
 
-/**
- * requireAuth(event) → { session } | {statusCode,...}
- * 401 якщо немає чи прострочена сесія.
- */
+/** requireAuth(event) → { session } | 401 */
 async function requireAuth(event) {
   const signed = readSignedSessionCookie(event);
   if (!signed) {
@@ -224,10 +233,7 @@ async function requireAuth(event) {
   return { session: sess };
 }
 
-/**
- * requireAdmin(event) → { session } | {statusCode,...}
- * 401 без сесії; 403 якщо роль != 'admin' (архітектура: адмін-ендпоїнти лише для admin) :contentReference[oaicite:1]{index=1}
- */
+/** requireAdmin(event) → { session } | 401/403 */
 async function requireAdmin(event) {
   const res = await requireAuth(event);
   if (!res.session) return res; // 401
