@@ -1,5 +1,6 @@
 // POST /.netlify/functions/setSort
 // Архітектура v1.1: cookie-сесія (admin) + CSRF, м'які rate limits, валідація payload
+// РОБАСТНИЙ парсинг тіла: JSON або application/x-www-form-urlencoded (+ base64 підтримка)
 
 const { Pool } = require("pg");
 const crypto = require("crypto");
@@ -42,6 +43,17 @@ function parseCookies(header) {
   }
   return out;
 }
+function parseFormURLEncoded(body) {
+  const out = {};
+  for (const kv of String(body || "").split("&")) {
+    if (!kv) continue;
+    const [k, v = ""] = kv.split("=");
+    const key = decodeURIComponent(k.replace(/\+/g, " "));
+    const val = decodeURIComponent(v.replace(/\+/g, " "));
+    out[key] = val;
+  }
+  return out;
+}
 
 // ==== ENV/DB =================================================================
 const connectionString = process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
@@ -71,10 +83,6 @@ function verifyCsrfToken(sid, headerVal) {
 }
 
 // ==== Rate Limits (Fixed Window) ============================================
-// Для легкого mutation-ендпоінта ставимо м’які значення:
-// - Session: 5/60s
-// - IP:      20/60s
-// - Global:  100/60s
 const RL_SESS_LIMIT = 5,   RL_SESS_WINDOW_SEC = 60;
 const RL_IP_LIMIT   = 20,  RL_IP_WINDOW_SEC   = 60;
 const RL_GLOB_LIMIT = 100, RL_GLOB_WINDOW_SEC = 60;
@@ -118,7 +126,6 @@ function getClientIp(event) {
 }
 
 // ==== Payload validation =====================================================
-// Якщо у твоєму v1.1 whitelist інший — підженемо в наступному кроці.
 const ALLOWED_COLS = new Set([
   "kickoff_at",
   "tournament",
@@ -139,23 +146,33 @@ exports.handler = async (event) => {
       return json(405, { ok: false, error: "Method Not Allowed" });
     }
 
-    // --- Parse body (JSON; підтримка base64) ---
+    // --- Робастний парсинг тіла ---
     const ctRaw = event.headers["content-type"] || event.headers["Content-Type"] || "";
     const ctype = ctRaw.split(";")[0].trim().toLowerCase();
+
     let raw = event.body || "";
     if (raw && event.isBase64Encoded) {
       try { raw = Buffer.from(raw, "base64").toString("utf8"); }
       catch { return json(400, { ok: false, error: "invalid_body_b64" }); }
     }
-    if (ctype !== "application/json") {
-      return json(415, { ok: false, error: "unsupported_media_type" });
-    }
-    let body;
-    try { body = raw ? JSON.parse(raw) : {}; } 
-    catch { return json(400, { ok: false, error: "invalid_json" }); }
 
-    const sort_col = normStr(body.col);
-    const sort_order = normStr(body.order || "asc").toLowerCase();
+    let sort_col = "";
+    let sort_order = "asc";
+
+    if (ctype === "application/x-www-form-urlencoded") {
+      const form = parseFormURLEncoded(raw);
+      sort_col = normStr(form.col);
+      sort_order = normStr(form.order || "asc").toLowerCase();
+    } else {
+      // За замовчанням — JSON (допускаємо application/json і відсутній/дивний Content-Type)
+      try {
+        const body = raw ? JSON.parse(raw) : {};
+        sort_col = normStr(body.col);
+        sort_order = normStr(body.order || "asc").toLowerCase();
+      } catch {
+        return json(400, { ok: false, error: "invalid_json" });
+      }
+    }
 
     if (!ALLOWED_COLS.has(sort_col)) {
       return json(400, { ok: false, error: "invalid_col", allowed: Array.from(ALLOWED_COLS) });
