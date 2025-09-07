@@ -194,7 +194,7 @@ Invoke-WebRequest -Uri "$FN/import-to-staging" -Method POST `
 * `Authorization: Bearer <UPDATE_TOKEN>`
 * `X-Update-Token: <UPDATE_TOKEN>`
 
-> Порада: підготуй `$origin` один раз для заголовків (сумісно з Windows PowerShell 5.x):
+> Порада: підготуй `$origin` раз (сумісно з Windows PowerShell 5.x):
 >
 > ```powershell
 > $origin = if ($env:APP_ORIGIN) { $env:APP_ORIGIN } else { "https://football-m.netlify.app" }
@@ -369,3 +369,36 @@ HAVING COUNT(*) > 1;
 * [ ] `GET /matches` відображає очікувані зміни (без score-полів).
 * [ ] SQL-перевірки в `staging_matches`, `sync_logs`.
 * [ ] Відсутні дублікати `(date_bucket, pair_key)` у `matches`.
+
+---
+
+## 9) Smoke-скрипт для перевірки безпеки
+
+У репозиторії є скрипт **`dev/ops-auth-smoke.ps1`** (Windows PowerShell 5.x), що виконує швидку перевірку CORS/токена та (опційно) цикл `login → me → logout`.
+
+**Запуск (рекомендовано):**
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\dev\ops-auth-smoke.ps1 `
+  -FunctionsBase "https://football-m.netlify.app/.netlify/functions" `
+  -Origin "https://football-m.netlify.app" `
+  -UpdateToken "<UPDATE_TOKEN>"
+```
+
+> Якщо не хочеш передавати токен у команді:
+>
+> ```powershell
+> $env:UPDATE_TOKEN = "<UPDATE_TOKEN>"
+> powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\dev\ops-auth-smoke.ps1 `
+>   -FunctionsBase "https://football-m.netlify.app/.netlify/functions" `
+>   -Origin "https://football-m.netlify.app"
+> ```
+
+**Очікування:** у фіналі скрипт друкує `ALL CHECKS PASSED`.
+Опціонально додай у корінь `login.json` із валідними кредами:
+
+```json
+{"username":"...", "password":"..."}
+```
+
+тоді скрипт додатково перевірить `login/me/logout`.
