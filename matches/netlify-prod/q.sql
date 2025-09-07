@@ -1,0 +1,1 @@
+﻿SELECT happened_at, op, trigger_type, status, items_total, items_inserted, items_skipped FROM sync_logs WHERE op='merge' ORDER BY happened_at DESC, id DESC LIMIT 3;
