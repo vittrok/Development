@@ -1,45 +1,62 @@
 // functions/me.js
 /* eslint-disable */
-const { corsHeaders, parseCookies, clientIp, userAgent, signCsrf } = require('./_utils');
 const { getSession } = require('./_session');
+
+function allowedOrigin() {
+  return process.env.APP_ORIGIN || 'https://football-m.netlify.app';
+}
+
+function corsHeaders() {
+  return {
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Origin': allowedOrigin(),
+    'Access-Control-Allow-Methods': 'GET,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With, X-CSRF',
+  };
+}
+
+function json(statusCode, data, extraHeaders = {}) {
+  return {
+    statusCode,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...corsHeaders(),
+      ...extraHeaders,
+    },
+    body: JSON.stringify(data),
+  };
+}
 
 exports.handler = async (event) => {
   // CORS preflight
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: corsHeaders() };
+    return {
+      statusCode: 204,
+      headers: corsHeaders(),
+      body: '',
+    };
   }
 
   if (event.httpMethod !== 'GET') {
-    return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
+    return json(405, { ok: false, error: 'Method Not Allowed' });
   }
 
   try {
-    const cookies = parseCookies(event.headers.cookie || event.headers.Cookie);
-    const signed = cookies['session'];
-    const sess = signed ? await getSession(signed) : null;
-
+    const sess = await getSession(event); // перевіряє HMAC підпис і валідність у БД
     if (!sess) {
-      return {
-        statusCode: 200,
-        headers: corsHeaders(),
-        body: JSON.stringify({ authenticated: false }),
-      };
+      return json(200, {
+        ok: true,
+        auth: { isAuthenticated: false, role: null, sid_prefix: null },
+      });
     }
 
-    // CSRF: HMAC із прив’язкою до IP/UA/часу (реалізація в _utils.signCsrf)
-    const csrf = signCsrf({ ip: clientIp(event), ua: userAgent(event), ts: Date.now() });
-
-    return {
-      statusCode: 200,
-      headers: corsHeaders(),
-      body: JSON.stringify({
-        authenticated: true,
-        role: sess.role || 'user',
-        csrf,
-      }),
-    };
+    const sid_prefix = String(sess.sid).slice(0, 8);
+    return json(200, {
+      ok: true,
+      auth: { isAuthenticated: true, role: sess.role || 'user', sid_prefix },
+    });
   } catch (e) {
-    console.error('[/me] error:', e);
-    return { statusCode: 500, headers: corsHeaders(), body: 'me failed' };
+    console.error('[me] error:', e);
+    return json(500, { ok: false, error: 'Internal Server Error' });
   }
 };
