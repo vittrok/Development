@@ -1,177 +1,209 @@
-// functions/login.js
-/* eslint-disable */
-const crypto = require('crypto');
-const { corsHeaders, getPool, checkAndIncRateLimit, clientIp } = require('./_utils');
-const { createSession } = require('./_session');
+// POST /login
+// Архітектура v1.1: створення cookie-сесії (HttpOnly; Secure; SameSite=Lax; Max-Age=30d)
+// Приймає JSON або application/x-www-form-urlencoded
+// Валідація: ADMIN_USERNAME + ADMIN_PASSWORD_HASH (bcrypt). Якщо HASH відсутній — допускаємо ADMIN_PASSWORD (лише для зручності).
 
-const pool = getPool();
+const { Pool } = require("pg");
+const crypto = require("crypto");
 
-/* -------------------- robust body parsing -------------------- */
-function tryParseJSON(s) { try { return JSON.parse(s); } catch { return null; } }
-function fromUrlEncoded(raw) {
-  const params = new URLSearchParams(String(raw).replace(/^\?/, ''));
-  const obj = {};
-  for (const [k, v] of params) obj[k] = v;
-  return obj;
+let bcrypt;
+try {
+  bcrypt = require("bcryptjs"); // легша залежність для функцій
+} catch {
+  bcrypt = null;
 }
-function getJsonBody(event) {
-  if (!event) return null;
-  let raw = event.body;
 
-  if (event.isBase64Encoded && typeof raw === 'string') {
-    try { raw = Buffer.from(raw, 'base64').toString('utf8'); } catch {}
+const ORIGIN = "https://football-m.netlify.app";
+const corsHeaders = {
+  "Access-Control-Allow-Credentials": "true",
+  "Access-Control-Allow-Origin": ORIGIN,
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-Requested-With, X-CSRF",
+  "Content-Type": "application/json; charset=utf-8",
+  "Cache-Control": "no-cache",
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+  "X-Content-Type-Options": "nosniff",
+  Vary: "Origin",
+};
+
+function json(status, obj, extraHeaders = {}) {
+  return {
+    statusCode: status,
+    headers: { ...corsHeaders, ...extraHeaders },
+    body: JSON.stringify(obj),
+  };
+}
+
+function hmacHex(secret, data) {
+  return crypto.createHmac("sha256", String(secret)).update(String(data)).digest("hex");
+}
+
+function timingSafeEq(a, b) {
+  const aa = Buffer.from(String(a) || "");
+  const bb = Buffer.from(String(b) || "");
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
+}
+
+function normStr(v) {
+  return typeof v === "string" ? v.trim() : "";
+}
+
+function parseFormURLEncoded(body) {
+  const out = {};
+  for (const kv of body.split("&")) {
+    const [k, v = ""] = kv.split("=");
+    const key = decodeURIComponent(k.replace(/\+/g, " "));
+    const val = decodeURIComponent(v.replace(/\+/g, " "));
+    out[key] = val;
   }
-  if (raw && typeof raw === 'object') return raw;
-  if (typeof raw !== 'string') return null;
-
-  raw = raw.trim();
-  const ct = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
-
-  if (ct.includes('application/x-www-form-urlencoded') || (!raw.startsWith('{') && raw.includes('='))) {
-    return fromUrlEncoded(raw);
-  }
-
-  const obj = tryParseJSON(raw);
-  if (obj) return obj;
-
-  return null;
-}
-/* ------------------------------------------------------------- */
-
-function signSid(sid) {
-  const secret = process.env.SESSION_SECRET || process.env.JWT_SECRET || 'dev-secret';
-  return crypto.createHmac('sha256', secret).update(String(sid)).digest('base64url');
-}
-function safeEq(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const A = Buffer.from(a, 'utf8');
-  const B = Buffer.from(b, 'utf8');
-  if (A.length !== B.length) return false;
-  try { return crypto.timingSafeEqual(A, B); } catch { return false; }
+  return out;
 }
 
-let bcrypt = null;
-try { bcrypt = require('bcryptjs'); } catch { try { bcrypt = require('bcrypt'); } catch { bcrypt = null; } }
+const connectionString =
+  process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
+const SESSION_SECRET = process.env.SESSION_SECRET || "";
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "";
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || ""; // bcrypt hash за архітектурою
+const ADMIN_PASSWORD_PLAIN = process.env.ADMIN_PASSWORD || "";     // необов'язковий fallback
 
-/** Пробує знайти користувача по username → login → email. Повертає об’єкт із УСІМА полями (jsonb). */
-async function findUserRecord(identifier) {
-  const tries = [
-    `SELECT to_jsonb(u) AS usr FROM users u WHERE u.username = $1 LIMIT 1`,
-    `SELECT to_jsonb(u) AS usr FROM users u WHERE u.login    = $1 LIMIT 1`,
-    `SELECT to_jsonb(u) AS usr FROM users u WHERE u.email    = $1 LIMIT 1`,
-  ];
-  for (const q of tries) {
-    try {
-      const { rows } = await pool.query(q, [identifier]);
-      if (rows.length && rows[0].usr) return rows[0].usr;
-    } catch (e) {
-      if (!(e && e.code === '42703')) throw e;
-    }
-  }
-  return null;
-}
-function pickUserId(u) { return u.id ?? u.user_id ?? u.uid ?? null; }
-function pickRole(u)   { return u.role ?? u.user_role ?? 'user'; }
-function pickPasswordCandidates(u) {
-  const hashKeys = ['password_hash','pwd_hash','pass_hash','hash','passwordhash'];
-  const plainKeys = ['password','pass','pwd'];
-  let hash = null, plain = null;
-  for (const k of hashKeys) if (typeof u[k] === 'string' && u[k]) { hash = u[k]; break; }
-  for (const k of plainKeys) if (typeof u[k] === 'string' && u[k]) { plain = u[k]; break; }
-  return { hash, plain };
+const pool = new Pool({
+  connectionString,
+  ssl: { rejectUnauthorized: false },
+});
+
+// зручний хелпер для дати + N днів
+function addDays(date, days) {
+  const d = new Date(date.getTime());
+  d.setDate(d.getDate() + days);
+  return d;
 }
 
 exports.handler = async (event) => {
-  // CORS preflight
-  if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: corsHeaders() };
-  }
-  if (event.httpMethod !== 'POST') {
-    return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
-  }
-
   try {
-    const body = getJsonBody(event);
-    if (!body || typeof body.username !== 'string' || typeof body.password !== 'string') {
-      return { statusCode: 400, headers: corsHeaders(), body: 'Invalid JSON body' };
+    if (event.httpMethod === "OPTIONS") {
+      return { statusCode: 200, headers: corsHeaders, body: "" };
     }
-    const { username, password } = body;
-
-    // === Rate limit: 5 спроб за 15 хв для IP+username ===
-    const ip = clientIp(event);
-    const key = `login:${ip}:${(username || '').toLowerCase()}`;
-    const rl = await checkAndIncRateLimit(key, 5, 15 * 60); // 5/900s
-
-    if (rl.limited) {
-      return {
-        statusCode: 429,
-        headers: { ...corsHeaders(), 'Retry-After': String(rl.retryAfterSec) },
-        body: 'too many attempts',
-      };
+    if (event.httpMethod !== "POST") {
+      return json(405, { ok: false, error: "Method Not Allowed" });
     }
 
-    // 1) Знайти користувача
-    const u = await findUserRecord(username);
-    if (!u) {
-      return {
-        statusCode: 401,
-        headers: { ...corsHeaders(), 'X-RateLimit-Remaining': String(Math.max(0, rl.remaining)) },
-        body: 'login failed',
-      };
-    }
+    // --- Робастний парсинг тіла ---
+    const ctRaw = event.headers["content-type"] || event.headers["Content-Type"] || "";
+    const ctype = ctRaw.split(";")[0].trim().toLowerCase();
 
-    // 2) Перевірити пароль
-    const { hash, plain } = pickPasswordCandidates(u);
-    let ok = false;
-
-    if (!ok && hash && bcrypt) {
-      try { ok = await bcrypt.compare(password, hash); } catch {}
-    }
-    if (!ok && plain) {
-      ok = safeEq(password, plain);
-    }
-    if (!ok && process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD) {
-      if (safeEq(username, process.env.ADMIN_USERNAME) && safeEq(password, process.env.ADMIN_PASSWORD)) {
-        ok = true;
+    let raw = event.body || "";
+    if (raw && event.isBase64Encoded) {
+      // Netlify інколи передає base64; декодуємо як utf8
+      try {
+        raw = Buffer.from(raw, "base64").toString("utf8");
+      } catch {
+        return json(400, { ok: false, error: "Invalid JSON body (b64 decode)" });
       }
     }
-    if (!ok) {
-      return {
-        statusCode: 401,
-        headers: { ...corsHeaders(), 'X-RateLimit-Remaining': String(Math.max(0, rl.remaining)) },
-        body: 'login failed',
-      };
+
+    let username = "";
+    let password = "";
+
+    if (ctype === "application/x-www-form-urlencoded") {
+      const form = parseFormURLEncoded(raw);
+      username = normStr(form.username);
+      password = normStr(form.password);
+    } else {
+      // за замовчанням очікуємо JSON
+      try {
+        const body = raw ? JSON.parse(raw) : {};
+        username = normStr(body.username);
+        password = normStr(body.password);
+      } catch {
+        return json(400, { ok: false, error: "Invalid JSON body" });
+      }
     }
 
-    // 3) Створити сесію в БД
-    const userId = pickUserId(u);
-    const role   = pickRole(u);
-    if (!userId) {
-      return { statusCode: 500, headers: corsHeaders(), body: 'login failed' };
+    if (!username || !password) {
+      return json(400, { ok: false, error: "missing_credentials" });
     }
 
-    const ttlSeconds = 60 * 60 * 24 * 30; // 30 днів
-    const sess = await createSession({ userId, role, ttlSeconds });
+    // --- Перевірка логіна ---
+    if (!ADMIN_USERNAME) {
+      return json(500, { ok: false, error: "config_missing_admin_username" });
+    }
 
-    // 4) Cookie session=sid.sig
-    const sig = signSid(sess.sid);
-    const cookieVal = encodeURIComponent(`${sess.sid}.${sig}`);
-    const cookie = [
-      `session=${cookieVal}`,
-      'Path=/',
-      'HttpOnly',
-      'Secure',
-      'SameSite=Strict',
-      `Max-Age=${ttlSeconds}`,
-    ].join('; ');
+    const userOk = timingSafeEq(username, ADMIN_USERNAME);
+    let passOk = false;
 
-    return {
-      statusCode: 200,
-      headers: { ...corsHeaders(), 'Set-Cookie': cookie, 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({ ok: true, role }),
-    };
+    if (ADMIN_PASSWORD_HASH) {
+      if (!bcrypt) {
+        return json(500, { ok: false, error: "bcrypt_unavailable" });
+      }
+      try {
+        passOk = await bcrypt.compare(password, ADMIN_PASSWORD_HASH);
+      } catch {
+        passOk = false;
+      }
+    } else if (ADMIN_PASSWORD_PLAIN) {
+      passOk = timingSafeEq(password, ADMIN_PASSWORD_PLAIN);
+    } else {
+      return json(500, { ok: false, error: "config_missing_password" });
+    }
+
+    if (!userOk || !passOk) {
+      // навмисно не уточнюємо, що саме не так
+      return json(401, { ok: false, error: "invalid_credentials" });
+    }
+
+    // --- Створення/запис сесії ---
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // знаходимо користувача (admin), або створимо якщо немає
+      const u = await client.query(`SELECT id, role FROM users WHERE username = $1`, [ADMIN_USERNAME]);
+      let userId;
+      if (u.rowCount) {
+        userId = u.rows[0].id;
+      } else {
+        const ins = await client.query(
+          `INSERT INTO users(username, password_hash, role, created_at)
+           VALUES ($1, $2, 'admin', now())
+           RETURNING id`,
+          [ADMIN_USERNAME, ADMIN_PASSWORD_HASH || null]
+        );
+        userId = ins.rows[0].id;
+      }
+
+      // робимо нову сесію на 30 днів
+      const sid = crypto.randomUUID();
+      const sig = hmacHex(SESSION_SECRET, sid);
+      const issuedAt = new Date();
+      const expiresAt = addDays(issuedAt, 30);
+
+      await client.query(
+        `
+        INSERT INTO sessions(sid, user_id, issued_at, expires_at, revoked)
+        VALUES ($1, $2, now(), $3, false)
+        `,
+        [sid, userId, expiresAt.toISOString()]
+      );
+
+      await client.query(
+        `UPDATE users SET last_login_at = now() WHERE id = $1`,
+        [userId]
+      );
+
+      await client.query("COMMIT");
+
+      const cookie = `session=${sid}.${sig}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${30 * 24 * 60 * 60}`;
+      return json(200, { ok: true }, { "Set-Cookie": cookie });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error("[login] db error:", e);
+      return json(500, { ok: false, error: "db_failed" });
+    } finally {
+      client.release();
+    }
   } catch (e) {
-    console.error('[/login] error:', e);
-    return { statusCode: 500, headers: corsHeaders(), body: 'login failed' };
+    console.error("[login] fatal:", e);
+    return json(500, { ok: false, error: "internal" });
   }
 };
