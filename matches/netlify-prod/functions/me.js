@@ -55,8 +55,9 @@ exports.handler = async (event) => {
     }
 
     const sid_prefix = String(sess.sid).slice(0, 8);
-    // Видаємо CSRF-токен, підписаний бекендом (прив’язаний до сесії)
-    const csrf = signCsrf(sess.sid);
+    // ВАЖЛИВО: CSRF-пейлоад має містити ts (мітку часу), інакше verifyCsrf відхилить токен
+    const csrfPayload = { sid: sess.sid, ts: Date.now() };
+    const csrf = signCsrf(csrfPayload);
 
     return json(200, {
       ok: true,
