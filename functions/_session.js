@@ -4,8 +4,12 @@ const crypto = require('crypto');
 const { getPool } = require('./_utils');
 
 const pool = getPool();
+const COOKIE_NAME = 'session';
 
-/** Витягає значення cookie "session" (рядок формату "sid.sig") */
+/**
+ * Витягує значення cookie "session" (рядок формату "sid.sig")
+ * Підтримує як прямий рядок "sid.sig", так і Netlify event з headers.cookie
+ */
 function extractSigned(input) {
   if (typeof input === 'string') return input;
   if (input && input.headers) {
@@ -17,16 +21,47 @@ function extractSigned(input) {
 }
 
 /**
+ * HMAC-підпис sid: base64url(HMAC-SHA256(SESSION_SECRET, sid))
+ */
+function signSid(sid, secret = process.env.SESSION_SECRET || 'dev-secret') {
+  return crypto
+    .createHmac('sha256', String(secret))
+    .update(String(sid))
+    .digest('base64url');
+}
+
+/**
+ * Перевіряє підпис "sid.sig", повертає валідний sid або null
+ */
+function verifySigned(signed, secret = process.env.SESSION_SECRET || 'dev-secret') {
+  if (!signed || typeof signed !== 'string') return null;
+  const dot = signed.lastIndexOf('.');
+  if (dot <= 0) return null;
+  const sid = signed.slice(0, dot);
+  const sig = signed.slice(dot + 1);
+  if (!sid || !sig) return null;
+  const good = signSid(sid, secret);
+  try {
+    const a = Buffer.from(sig, 'utf8');
+    const b = Buffer.from(good, 'utf8');
+    if (a.length !== b.length) return null;
+    if (!crypto.timingSafeEqual(a, b)) return null;
+  } catch {
+    return null;
+  }
+  return sid;
+}
+
+/**
  * getSession(input)
- * input: рядок "sid.sig" або Netlify event
- * Повертає { role, sid } або null, якщо сесію не знайдено/прострочено/відкликано.
+ * input: рядок "sid.sig" або Netlify event (headers.cookie)
+ * Повертає { role, sid } або null (некоректний підпис/не знайдено/прострочено/відкликано)
  */
 async function getSession(input) {
   const signed = extractSigned(input);
   if (!signed) return null;
 
-  // cookie "sid.sig" → беремо першу частину як sid
-  const sid = String(signed).split('.')[0];
+  const sid = verifySigned(String(signed));
   if (!sid) return null;
 
   const q = `
@@ -50,10 +85,11 @@ async function getSession(input) {
 
 /**
  * createSession(userIdOrObj, role?, ttlSeconds?)
- * Сумісна сигнатура:
+ * Сигнатури:
  *  - createSession(userId, role?, ttlSeconds?)
  *  - createSession({ userId, role?, ttlSeconds? })
  * Повертає { sid, role, expiresAt }.
+ * Примітка: цей метод лише створює запис у БД; видача cookie виконується у відповідному ендпоїнті (login).
  */
 async function createSession(userIdOrObj, maybeRole, maybeTtlSeconds) {
   let userId, role = 'user', ttlSeconds = 60 * 60 * 24 * 30; // 30 днів за замовчуванням
@@ -87,4 +123,11 @@ async function createSession(userIdOrObj, maybeRole, maybeTtlSeconds) {
   return { sid, role, expiresAt: expiresAt.toISOString() };
 }
 
-module.exports = { getSession, createSession };
+module.exports = {
+  getSession,
+  createSession,
+  signSid,
+  verifySigned,
+  extractSigned,
+  COOKIE_NAME,
+};
