@@ -1,3 +1,4 @@
 cookies.txt
 dev/fixtures/*
 !dev/fixtures/README.md
+tests-cookies-data.ini
