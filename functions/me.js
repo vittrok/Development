@@ -1,6 +1,7 @@
 // functions/me.js
 /* eslint-disable */
 const { getSession } = require('./_session');
+const { signCsrf } = require('./_utils'); // архітектурні примітиви CSRF
 
 function allowedOrigin() {
   return process.env.APP_ORIGIN || 'https://football-m.netlify.app';
@@ -42,18 +43,25 @@ exports.handler = async (event) => {
   }
 
   try {
-    const sess = await getSession(event); // перевіряє HMAC підпис і валідність у БД
+    const sess = await getSession(event); // перевіряє HMAC і валідність у БД
+
     if (!sess) {
+      // Анонімний користувач — CSRF не видаємо
       return json(200, {
         ok: true,
         auth: { isAuthenticated: false, role: null, sid_prefix: null },
+        csrf: null,
       });
     }
 
     const sid_prefix = String(sess.sid).slice(0, 8);
+    // Видаємо CSRF-токен, підписаний бекендом (прив’язаний до сесії)
+    const csrf = signCsrf(sess.sid);
+
     return json(200, {
       ok: true,
       auth: { isAuthenticated: true, role: sess.role || 'user', sid_prefix },
+      csrf,
     });
   } catch (e) {
     console.error('[me] error:', e);
