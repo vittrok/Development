@@ -1,6 +1,6 @@
 # Security Overview (Auth, CSRF, CORS, Tokens)
 
-**Версія:** 18.x  
+**Версія:** 18.2  
 **Останнє оновлення:** 2025-09-07  
 **Скоуп:** Netlify Functions (prod), Postgres/Neon, публічний GET для матчів.
 
@@ -9,7 +9,7 @@
 ## 1) Цілі безпеки
 
 - Публічний каталог матчів **без спойлерів** (жодних score-полів).
-- Захист адмін-операцій: merge зі staging → matches лише за наявності токена.
+- Захист адмін-операцій: import to staging та merge до канону — **лише з токеном**.
 - Браузерні виклики: контрольовані CORS + CSRF для state-changing сесійних дій.
 - Секрети зберігаються **лише** в Netlify env.
 
@@ -17,14 +17,14 @@
 
 ## 2) Матриця ендпоїнтів та авторизації
 
-| Ендпоїнт                                      | Метод | Хто може | Захист                                         |
-|-----------------------------------------------|-------|---------|-----------------------------------------------|
-| `/.netlify/functions/matches`                 | GET   | публічно| CORS (read), **без score**                    |
-| `/.netlify/functions/import-to-staging`       | POST  | технічна інтеграція / оператор | CORS allowlist; тіло JSON або base64; **без токена**; валідація/канонізація ідемпотентного імпорту |
-| `/.netlify/functions/update-matches`          | POST  | оператор| **UPDATE_TOKEN** (Bearer або `X-Update-Token`); CORS allowlist |
+| Ендпоїнт                                      | Метод | Хто може                                  | Захист                                                    |
+|-----------------------------------------------|-------|-------------------------------------------|-----------------------------------------------------------|
+| `/.netlify/functions/matches`                 | GET   | публічно                                  | CORS (read), **без score**                                |
+| `/.netlify/functions/import-to-staging`       | POST  | технічна інтеграція / оператор             | **Authorization: Bearer `<UPDATE_TOKEN>`**; CORS allowlist |
+| `/.netlify/functions/update-matches`          | POST  | оператор                                  | **Authorization: Bearer `<UPDATE_TOKEN>`**; CORS allowlist |
 | `/.netlify/functions/login` → `/.netlify/functions/me` → `/.netlify/functions/logout` | POST/GET/POST | оператор (браузер) | HttpOnly cookie (sid.sig), **CSRF** на state-changing, CORS allowlist |
 
-> Примітка: `import-to-staging` не має токена — це **свідомий дизайн** для простоти інтеграцій, при цьому обмежений CORS-оригіном і внутрішньою валідацією/канонізацією, а фактична публікація даних відбувається лише через захищений merge.
+> Примітка: `/import-to-staging` вимагає той самий `UPDATE_TOKEN`, що й `/update-matches`. Це зафіксовано як **прод-реальність** і синхронізовано з документацією.
 
 ---
 
@@ -48,8 +48,8 @@
 ## 5) Токен адмін-операцій (`UPDATE_TOKEN`)
 
 - Довгий секрет (Base64URL або hex), зберігається тільки в **Netlify env** (Production).
-- Передається як `Authorization: Bearer <UPDATE_TOKEN>` або `X-Update-Token: <UPDATE_TOKEN>`.
-- Ротація: генерувати новий → оновити env → redeploy → відкликати старий. **Не комітити.**
+- Передається як **`Authorization: Bearer <UPDATE_TOKEN>`**.
+- Ротація: генерувати новий → оновити env → **redeploy** → відкликати старий. **Не комітити.**
 
 ---
 
@@ -67,9 +67,9 @@
 
 ## 7) Потоки даних
 
-1. **Імпорт:** клієнт надсилає у `import-to-staging` (масив / `{matches:[…]}` / один об’єкт; JSON або base64).  
-2. **Валідація/канонізація:** staging перевірки, нормалізація полів.  
-3. **Merge:** `update-matches` (тільки з токеном) викликає БД-функцію `run_staging_validate_and_merge(...)`.  
+1. **Імпорт:** клієнт надсилає у `import-to-staging` (масив / `{matches:[…]}`; JSON або base64) **з Bearer-токеном**.  
+2. **Валідація/канонізація:** staging перевірки, нормалізація полів, єдиний `import_batch_id` на виклик.  
+3. **Merge:** `update-matches` (Bearer) викликає БД-функцію `run_staging_validate_and_merge(...)`.  
 4. **Публікація:** нові записи стають видимі в публічному `GET /matches` (без score-полів).
 
 ---
@@ -83,25 +83,6 @@
 
 ## 9) Траблшутінг (швидко)
 
-- **400 Invalid JSON body:** перевірити `Content-Type`, використовувати `--data-binary`, уникати BOM; fallback — base64 (`text/plain`).  
-- **401 Unauthorized (update-matches):** перевірити токен і `APP_ORIGIN`; redeploy після зміни env.  
-- **CSRF/403 на logout:** бракує `X-CSRF`/`X-Requested-With`/`Content-Type`.  
-- **Дані не з’являються в GET:** дивитися `staging_matches` + `sync_logs` + унікальність `(date_bucket, pair_key)`.
-
----
-
-## 10) Інструменти перевірки
-
-- `dev/ops-auth-smoke.ps1` — швидкий smoke CORS/Token/CSRF (Windows PowerShell 5.x).  
-- `docs/admin-ops.md` — покрокові інструкції з імпорту/merge + SQL-перевірки.
-
----
-
-## 11) Чек-ліст перед змінами
-
-- [ ] Токени/паролі лише в Netlify env.  
-- [ ] `APP_ORIGIN` узгоджений із фронтом.  
-- [ ] Жодних `score` у публічному API.  
-- [ ] Smoke (`dev/ops-auth-smoke.ps1`) зелений на проді.  
-- [ ] Аудит `sync_logs` без аномалій.
-
+- **401 Unauthorized:** відсутній або неправильний Bearer токен; перевірити Production env та зробити redeploy.  
+- **400 Invalid JSON body (Windows):** для `curl.exe` використовуйте `--data-binary` із файлу без BOM; або `Invoke-RestMethod`.  
+- **500 помилки схеми:** функція підлаштовується під наявні колонки (`venue`/`metadata` додаються, лише якщо існують). Якщо все одно 500 — перевірити актуальність таблиці `staging_matches` і параметри виклику.
