@@ -1,9 +1,10 @@
 // POST /update-matches
-// Архітектурні вимоги v1.1: idempotency (перед rate-limits), rate limits (global/IP), sync_lock
-// Тимчасово збережено OUT-OF-ARCH X-Update-Token (альтернатива Authorization: Bearer)
-// Далі (наступний крок) додамо cookie-сесії + CSRF.
+// Архітектура v1.1: cookie-сесії (admin) + CSRF, idempotency-first, rate limits (IP/Global/Session), sync_lock
+// OUT OF ARCHITECTURE, SUGGESTED OPTIONAL IMPROVEMENT!: підтримка X-Update-Token / Bearer як тимчасовий байпас
+// Після повного переходу на сесії — видалити байпас.
 
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 // ==== CORS/Headers ===========================================================
 const ORIGIN = "https://football-m.netlify.app"; // прод-оригін
@@ -12,7 +13,7 @@ const corsHeaders = {
   "Access-Control-Allow-Origin": ORIGIN,
   "Access-Control-Allow-Methods": "POST,OPTIONS",
   "Access-Control-Allow-Headers":
-    "Content-Type, Authorization, X-Requested-With, X-CSRF, X-Update-Token, Idempotency-Key",
+    "Content-Type, Authorization, Cookie, X-Requested-With, X-CSRF, X-Update-Token, Idempotency-Key",
   "Content-Type": "application/json; charset=utf-8",
   "Cache-Control": "no-cache",
   "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
@@ -30,18 +31,39 @@ function json(status, obj, extraHeaders = {}) {
 function normStr(v) {
   return typeof v === "string" ? v.trim() : "";
 }
+function timingSafeEq(a, b) {
+  const aa = Buffer.from(String(a) || "");
+  const bb = Buffer.from(String(b) || "");
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
+}
+function hmacHex(secret, data) {
+  return crypto.createHmac("sha256", String(secret)).update(String(data)).digest("hex");
+}
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  const parts = header.split(";").map(s => s.trim());
+  for (const p of parts) {
+    const i = p.indexOf("=");
+    if (i > 0) out[p.slice(0, i)] = p.slice(i + 1);
+  }
+  return out;
+}
 
 // ==== ENV/DB =================================================================
 const connectionString =
   process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
 const UPDATE_TOKEN = process.env.UPDATE_TOKEN || null;
+const SESSION_SECRET = process.env.SESSION_SECRET || "";
+const CSRF_SECRET = process.env.CSRF_SECRET || "";
 
 const pool = new Pool({
   connectionString,
   ssl: { rejectUnauthorized: false },
 });
 
-// ==== Helpers: client IP =====================================================
+// ==== Helpers: client IP / cookie ============================================
 function getClientIp(event) {
   const h = event.headers || {};
   const ip1 = h["x-nf-client-connection-ip"] || h["X-Nf-Client-Connection-Ip"];
@@ -50,12 +72,56 @@ function getClientIp(event) {
   if (xff) return String(xff).split(",")[0].trim();
   return "0.0.0.0";
 }
+function getSessionCookie(event) {
+  const raw = event.headers?.cookie || event.headers?.Cookie || "";
+  const cookies = parseCookies(raw);
+  return cookies["session"] || "";
+}
+function parseSidSig(cookieVal) {
+  // "sid.sig" де sig = HMAC(SESSION_SECRET, sid)
+  if (!cookieVal) return null;
+  const dot = cookieVal.lastIndexOf(".");
+  if (dot <= 0) return null;
+  const sid = cookieVal.slice(0, dot);
+  const sig = cookieVal.slice(dot + 1);
+  return { sid, sig };
+}
+async function verifySession(client, sid, sig) {
+  if (!sid || !sig) return { ok: false, code: "bad_cookie" };
+  const expected = hmacHex(SESSION_SECRET, sid);
+  if (!timingSafeEq(sig, expected)) return { ok: false, code: "bad_sig" };
+
+  // lookup у sessions + users (admin)
+  const r = await client.query(
+    `
+    SELECT s.user_id, s.expires_at, s.revoked, u.role
+    FROM sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.sid = $1
+    `,
+    [sid]
+  );
+  if (!r.rowCount) return { ok: false, code: "no_session" };
+  const row = r.rows[0];
+  if (row.revoked) return { ok: false, code: "revoked" };
+  if (!row.expires_at || new Date(row.expires_at) <= new Date()) {
+    return { ok: false, code: "expired" };
+  }
+  if (row.role !== "admin") return { ok: false, code: "forbidden" };
+  return { ok: true, userId: row.user_id, role: row.role, sid };
+}
+function verifyCsrfToken(sid, headerVal) {
+  if (!sid || !headerVal) return false;
+  const expected = hmacHex(CSRF_SECRET, sid);
+  return timingSafeEq(expected, headerVal);
+}
 
 // ==== Rate Limit (Fixed Window) ==============================================
-// rate_limits(key PK, count int, reset_at timestamptz)
-// Policies:
+// rate_limits(key PK, count int, reset_at timestamptz) — архітектура v1.1
+// Політики:
+// - IP:     1/5m
 // - Global: 1/2m
-// - IP: 1/5m
+// - Session:1/5m
 const RL_GLOBAL_KEY = "global:update-matches";
 const RL_GLOBAL_LIMIT = 1;
 const RL_GLOBAL_WINDOW_SEC = 120;
@@ -65,6 +131,13 @@ function rlIpKey(ip) {
 }
 const RL_IP_LIMIT = 1;
 const RL_IP_WINDOW_SEC = 300;
+
+function rlSessKey(sid) {
+  const pref = sid ? String(sid).slice(0, 8) : "anon";
+  return `sess:${pref}:update-matches`;
+}
+const RL_SESS_LIMIT = 1;
+const RL_SESS_WINDOW_SEC = 300;
 
 async function applyRateLimit(client, key, limit, windowSec) {
   const resNow = await client.query("SELECT now() AS now");
@@ -139,14 +212,14 @@ async function findByIdemKey(client, key) {
   );
   return r.rowCount ? r.rows[0] : null;
 }
-async function insertSyncLogStart(client, idemKey, source) {
+async function insertSyncLogStart(client, idemKey, source, actorUserId) {
   const r = await client.query(
     `
-    INSERT INTO sync_logs(started_at, status, inserted, updated, skipped, source, idempotency_key)
-    VALUES (now(), 'ok', 0, 0, 0, $1, $2)
+    INSERT INTO sync_logs(started_at, status, inserted, updated, skipped, source, idempotency_key, actor_user_id)
+    VALUES (now(), 'ok', 0, 0, 0, $1, $2, $3)
     RETURNING id, started_at
   `,
-    [source || "manual", idemKey || null]
+    [source || "manual", idemKey || null, actorUserId || null]
   );
   return r.rows[0];
 }
@@ -175,24 +248,6 @@ exports.handler = async (event) => {
     }
     if (event.httpMethod !== "POST") {
       return json(405, { ok: false, error: "Method Not Allowed" });
-    }
-
-    // --- OUT OF ARCH token guard (тимчасово) --------------------------------
-    if (UPDATE_TOKEN) {
-      const auth =
-        event.headers.authorization ||
-        event.headers.Authorization ||
-        "";
-      const xu =
-        (event.headers["x-update-token"] || event.headers["X-Update-Token"] || "").trim();
-
-      const token = auth.startsWith("Bearer ")
-        ? auth.slice("Bearer ".length).trim()
-        : (xu || "");
-
-      if (!token || token !== UPDATE_TOKEN) {
-        return json(401, { ok: false, error: "Unauthorized" });
-      }
     }
 
     // --- Robust body parse ---------------------------------------------------
@@ -228,7 +283,23 @@ exports.handler = async (event) => {
     try {
       await client.query("BEGIN");
 
-      // 1) Idempotency-first: якщо є дубль — повертаємо попередній результат БЕЗ rate-limit
+      // 0) OUT OF ARCH token bypass (тільки якщо надано й валідний — для твоїх скриптів)
+      // УВАГА: це тимчасово. Коли закінчимо міграцію — прибираємо.
+      let bypassAuth = false;
+      if (UPDATE_TOKEN) {
+        const auth =
+          event.headers.authorization ||
+          event.headers.Authorization ||
+          "";
+        const xu =
+          (event.headers["x-update-token"] || event.headers["X-Update-Token"] || "").trim();
+        const token = auth.startsWith("Bearer ")
+          ? auth.slice("Bearer ".length).trim()
+          : (xu || "");
+        if (token && token === UPDATE_TOKEN) bypassAuth = true;
+      }
+
+      // 1) Idempotency-first: дубль повертаємо раніше за ліміти/автентифікацію
       if (idemKey) {
         const prev = await findByIdemKey(client, idemKey);
         if (prev && prev.status === "ok") {
@@ -245,7 +316,45 @@ exports.handler = async (event) => {
         }
       }
 
-      // 2) Rate limits (IP → Global)
+      // 2) Автентифікація (cookie-сесія admin) + CSRF, якщо НЕ байпас
+      let actorUserId = null;
+      let sidForSessLimit = "anon";
+
+      if (!bypassAuth) {
+        const cookieVal = getSessionCookie(event);
+        const parsed = parseSidSig(cookieVal) || {};
+        const ver = await verifySession(client, parsed.sid, parsed.sig);
+        if (!ver.ok) {
+          await client.query("ROLLBACK");
+          return json(401, { ok: false, error: "unauthorized_session", code: ver.code });
+        }
+        const csrfHeader = event.headers["x-csrf"] || event.headers["X-CSRF"] || "";
+        if (!verifyCsrfToken(ver.sid, csrfHeader)) {
+          await client.query("ROLLBACK");
+          return json(403, { ok: false, error: "csrf_invalid" });
+        }
+        actorUserId = ver.userId;
+        sidForSessLimit = ver.sid || "anon";
+      }
+
+      // 3) Rate limits: Session (якщо не байпас), потім IP, потім Global
+      if (!bypassAuth) {
+        const rlSess = await applyRateLimit(
+          client,
+          rlSessKey(sidForSessLimit),
+          RL_SESS_LIMIT,
+          RL_SESS_WINDOW_SEC
+        );
+        if (rlSess.limited) {
+          await client.query("ROLLBACK");
+          return json(
+            429,
+            { ok: false, error: "rate_limited_session" },
+            { "Retry-After": String(rlSess.retryAfter) }
+          );
+        }
+      }
+
       const rlIp = await applyRateLimit(
         client,
         rlIpKey(clientIp),
@@ -276,7 +385,7 @@ exports.handler = async (event) => {
         );
       }
 
-      // 3) Sync Lock
+      // 4) Sync Lock
       const nowRow = await client.query("SELECT now() AS now");
       const now = new Date(nowRow.rows[0].now);
       const lock = await loadLock(client);
@@ -286,14 +395,13 @@ exports.handler = async (event) => {
         await client.query("ROLLBACK");
         return json(204, { status: "locked_until", locked_till: lockedTill.toISOString() });
       }
-
       const until = new Date(now.getTime() + LOCK_HOLD_SEC * 1000).toISOString();
       await setLock(client, until);
 
-      // 4) Start sync_log
-      const log = await insertSyncLogStart(client, idemKey, source);
+      // 5) Start sync_log (actor_user_id якщо автентифіковано cookie-сесією)
+      const log = await insertSyncLogStart(client, idemKey, source, actorUserId);
 
-      // 5) Do merge
+      // 6) Do merge
       let counters = { inserted: 0, updated: 0, skipped: 0 };
       try {
         const res = await client.query(
