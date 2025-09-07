@@ -1,181 +1,266 @@
-// matches/netlify-prod/functions/import-to-staging.js
-// POST: додає записи у staging_matches (без мерджу).
-// Тіло: масив матчів, або { matches: [...] }, або один об'єкт.
-// Робастний парсинг (base64, BOM) + schema-heal + підтримка UUID для import_batch_id.
+// functions/import-to-staging.js
+// Netlify Function: POST /.netlify/functions/import-to-staging
+// Requires: UPDATE_TOKEN, APP_ORIGIN, DATABASE_URL (Postgres/Neon)
 
-const { Pool } = require("pg");
-const ORIGIN = "https://football-m.netlify.app";
-const corsHeaders = {
-  "Access-Control-Allow-Credentials": "true",
-  "Access-Control-Allow-Origin": ORIGIN,
+import crypto from "node:crypto";
+import { Pool } from "pg";
+
+/** ---------- ENV & DB ---------- */
+const {
+  UPDATE_TOKEN,
+  APP_ORIGIN,
+  DATABASE_URL,
+  NODE_ENV,
+} = process.env;
+
+if (!APP_ORIGIN) {
+  console.warn("[import-to-staging] APP_ORIGIN is not set");
+}
+if (!UPDATE_TOKEN) {
+  console.warn("[import-to-staging] UPDATE_TOKEN is not set");
+}
+if (!DATABASE_URL) {
+  console.warn("[import-to-staging] DATABASE_URL is not set");
+}
+
+let _pool;
+/** Singleton PG pool */
+function getPool() {
+  if (_pool) return _pool;
+  _pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false, // Neon friendly
+    },
+    max: 3,
+    idleTimeoutMillis: 10_000,
+    connectionTimeoutMillis: 5_000,
+  });
+  _pool.on("error", (err) => {
+    console.error("[pg] pool error:", err);
+  });
+  return _pool;
+}
+
+/** ---------- Helpers ---------- */
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": APP_ORIGIN || "*",
   "Access-Control-Allow-Methods": "POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-CSRF",
-  "Content-Type": "application/json; charset=utf-8",
-  "Cache-Control": "no-cache",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization, X-Requested-With, X-CSRF",
+  "Access-Control-Allow-Credentials": "true",
   "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+  "Cache-Control": "no-cache",
 };
 
-const connectionString = process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
-const UPDATE_TOKEN = process.env.UPDATE_TOKEN || null;
+function json(statusCode, body) {
+  return {
+    statusCode,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(body),
+  };
+}
 
-const pool = new Pool({ connectionString, ssl: { rejectUnauthorized: false } });
+function unauthorized() {
+  return json(401, { ok: false, error: "Unauthorized" });
+}
 
-exports.handler = async (event) => {
+function badRequest(message = "Invalid JSON body") {
+  return json(400, { ok: false, error: "Invalid JSON body", message });
+}
+
+function internalError(message = "Internal Server Error") {
+  return json(500, { ok: false, error: "Internal Server Error", message });
+}
+
+/** Parse body:
+ * - when "application/json": parse JSON
+ * - when "text/plain": treat as base64 and decode to utf8 JSON
+ */
+function parseBody(event) {
+  const ct = (event.headers?.["content-type"] ||
+    event.headers?.["Content-Type"] ||
+    "")
+    .split(";")[0]
+    .trim();
+
+  const raw = event.body ?? "";
+  if (!raw) return { matches: [] };
+
   try {
-    if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers: corsHeaders, body: "" };
-    if (event.httpMethod !== "POST") return json(405, { ok: false, error: "Method Not Allowed" });
-
-    // auth
-    if (UPDATE_TOKEN) {
-      const h = event.headers.authorization || event.headers.Authorization || "";
-      const token = h.startsWith("Bearer ") ? h.slice(7).trim() : "";
-      if (!token || token !== UPDATE_TOKEN) return json(401, { ok: false, error: "Unauthorized" });
-    }
-
-    // robust body parsing
-    let raw = event.body || "";
-    if (raw && event.isBase64Encoded) {
-      try { raw = Buffer.from(raw, "base64").toString("utf8"); }
-      catch { return json(400, { ok: false, error: "Invalid JSON body (b64 decode)" }); }
-    }
-    if (raw && raw.charCodeAt && raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
-    let body = {};
-    try { body = raw ? JSON.parse(raw) : {}; }
-    catch { return json(400, { ok: false, error: "Invalid JSON body" }); }
-
-    // normalize to array
-    let arr = [];
-    if (Array.isArray(body)) arr = body;
-    else if (body && Array.isArray(body.matches)) arr = body.matches;
-    else if (body && typeof body === "object" && Object.keys(body).length) arr = [body];
-    if (!Array.isArray(arr) || arr.length === 0) return json(400, { ok: false, error: "No items provided" });
-
-    // whitelist + minimal validation
-    const cleaned = [];
-    for (const it of arr) {
-      if (!it || typeof it !== "object") continue;
-      const item = {
-        kickoff_at:      normStr(it.kickoff_at),
-        league:          normStr(it.league),
-        status:          normStr(it.status),
-        home_team:       normStr(it.home_team),
-        away_team:       normStr(it.away_team),
-        source:          normStr(it.source),
-        import_batch_id: normStr(it.import_batch_id), // може бути UUID або довільний текст
-        link:            normStr(it.link),
-        tournament:      normStr(it.tournament),
-        rank:            toInt(it.rank),
-      };
-      if (!item.kickoff_at || !item.home_team || !item.away_team) continue;
-      cleaned.push(item);
-    }
-    if (cleaned.length === 0) return json(400, { ok: false, error: "No valid items" });
-
-    // schema-heal: легкі дефолти, не чіпаємо типи колонок
-    await pool.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_schema='public' AND table_name='staging_matches' AND column_name='created_at'
-        ) THEN
-          ALTER TABLE staging_matches ADD COLUMN created_at timestamptz;
-        END IF;
-        IF NOT EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_schema='public' AND table_name='staging_matches' AND column_name='home_away_confidence'
-        ) THEN
-          ALTER TABLE staging_matches ADD COLUMN home_away_confidence real;
-        END IF;
-      END$$;
-
-      ALTER TABLE staging_matches ALTER COLUMN imported_at SET DEFAULT now();
-      ALTER TABLE staging_matches ALTER COLUMN created_at  SET DEFAULT now();
-      UPDATE staging_matches SET created_at = now() WHERE created_at IS NULL;
-    `);
-
-    // дізнаємось тип колонки import_batch_id (uuid чи text)
-    const typRes = await pool.query(`
-      SELECT data_type
-      FROM information_schema.columns
-      WHERE table_schema='public' AND table_name='staging_matches' AND column_name='import_batch_id'
-      LIMIT 1
-    `);
-    const importBatchIsUUID = (typRes.rows[0]?.data_type || "").toLowerCase() === "uuid";
-
-    // формуємо SQL із правильним кастом для import_batch_id
-    let q;
-    if (importBatchIsUUID) {
-      // Якщо колонка uuid: беремо лише валідні UUID, інакше NULL
-      q = `
-        WITH src AS (SELECT $1::jsonb AS j),
-        rows AS (
-          SELECT
-            NULLIF(elem->>'kickoff_at','')::timestamptz  AS kickoff_at,
-            NULLIF(elem->>'league','')                   AS league,
-            NULLIF(elem->>'status','')                   AS status,
-            NULLIF(elem->>'home_team','')                AS home_team,
-            NULLIF(elem->>'away_team','')                AS away_team,
-            NULLIF(elem->>'source','')                   AS source,
-            CASE
-              WHEN (elem->>'import_batch_id') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-                THEN (elem->>'import_batch_id')::uuid
-              ELSE NULL::uuid
-            END                                          AS import_batch_id,
-            NULLIF(elem->>'link','')                     AS link,
-            NULLIF(elem->>'tournament','')               AS tournament,
-            NULLIF(elem->>'rank','')::int                AS rank
-          FROM src, jsonb_array_elements(src.j) elem
-        ),
-        ins AS (
-          INSERT INTO staging_matches
-            (kickoff_at, league, status, home_team, away_team, source, import_batch_id, link, tournament, rank)
-          SELECT kickoff_at, league, status, home_team, away_team, source, import_batch_id, link, tournament, rank
-          FROM rows
-          WHERE kickoff_at IS NOT NULL AND home_team IS NOT NULL AND away_team IS NOT NULL
-          RETURNING id
-        )
-        SELECT COUNT(*)::int AS inserted FROM ins;
-      `;
+    if (ct === "application/json") {
+      const obj = JSON.parse(event.isBase64Encoded ? Buffer.from(raw, "base64").toString("utf8") : raw);
+      return obj;
+    } else if (ct === "text/plain") {
+      const decoded = event.isBase64Encoded
+        ? Buffer.from(raw, "base64").toString("utf8")
+        : raw;
+      const jsonStr = Buffer.from(decoded, "base64").toString("utf8");
+      return JSON.parse(jsonStr);
     } else {
-      // Колонка текстова або відсутня: вставляємо як text
-      q = `
-        WITH src AS (SELECT $1::jsonb AS j),
-        rows AS (
-          SELECT
-            NULLIF(elem->>'kickoff_at','')::timestamptz  AS kickoff_at,
-            NULLIF(elem->>'league','')                   AS league,
-            NULLIF(elem->>'status','')                   AS status,
-            NULLIF(elem->>'home_team','')                AS home_team,
-            NULLIF(elem->>'away_team','')                AS away_team,
-            NULLIF(elem->>'source','')                   AS source,
-            NULLIF(elem->>'import_batch_id','')          AS import_batch_id,
-            NULLIF(elem->>'link','')                     AS link,
-            NULLIF(elem->>'tournament','')               AS tournament,
-            NULLIF(elem->>'rank','')::int                AS rank
-          FROM src, jsonb_array_elements(src.j) elem
-        ),
-        ins AS (
-          INSERT INTO staging_matches
-            (kickoff_at, league, status, home_team, away_team, source, import_batch_id, link, tournament, rank)
-          SELECT kickoff_at, league, status, home_team, away_team, source, import_batch_id, link, tournament, rank
-          FROM rows
-          WHERE kickoff_at IS NOT NULL AND home_team IS NOT NULL AND away_team IS NOT NULL
-          RETURNING id
-        )
-        SELECT COUNT(*)::int AS inserted FROM ins;
-      `;
+      // try best-effort JSON
+      const buf = event.isBase64Encoded ? Buffer.from(raw, "base64") : Buffer.from(raw);
+      return JSON.parse(buf.toString("utf8"));
+    }
+  } catch (e) {
+    throw new Error(`Parse error: ${e.message}`);
+  }
+}
+
+/** Minimal record validation + normalization */
+function normalizeMatch(x) {
+  if (!x || typeof x !== "object") throw new Error("Item must be an object");
+  const league = String(x.league ?? "").trim();
+  const home_team = String(x.home_team ?? "").trim();
+  const away_team = String(x.away_team ?? "").trim();
+  const status = String(x.status ?? "").trim();
+  const kickoff_at_raw = x.kickoff_at ?? x.kickoffAt ?? x.kickoff;
+
+  if (!league) throw new Error("league is required");
+  if (!home_team) throw new Error("home_team is required");
+  if (!away_team) throw new Error("away_team is required");
+  if (!status) throw new Error("status is required");
+  if (!kickoff_at_raw) throw new Error("kickoff_at is required");
+
+  // Normalize time to ISO8601 Z
+  const kickoff = new Date(kickoff_at_raw);
+  if (isNaN(kickoff.getTime())) {
+    throw new Error("kickoff_at must be a valid date");
+  }
+  const kickoff_at = kickoff.toISOString();
+
+  const venue = x.venue == null ? null : String(x.venue).trim() || null;
+  const metadata =
+    x.metadata && typeof x.metadata === "object" ? x.metadata : {};
+
+  return {
+    league,
+    home_team,
+    away_team,
+    status,
+    kickoff_at,
+    venue,
+    metadata,
+  };
+}
+
+/** ---------- Auth ---------- */
+function readBearer(event) {
+  const h = event.headers || {};
+  const auth =
+    h.authorization ||
+    h.Authorization ||
+    "";
+  if (!auth.startsWith("Bearer ")) return null;
+  return auth.slice("Bearer ".length).trim();
+}
+
+function checkToken(event) {
+  const token = readBearer(event);
+  if (!token || !UPDATE_TOKEN) return false;
+  // constant-time compare
+  const a = Buffer.from(token);
+  const b = Buffer.from(UPDATE_TOKEN);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+/** ---------- Handler ---------- */
+
+export async function handler(event) {
+  try {
+    // CORS preflight
+    if (event.httpMethod === "OPTIONS") {
+      return {
+        statusCode: 200,
+        headers: CORS_HEADERS,
+        body: "",
+      };
     }
 
-    const { rows } = await pool.query(q, [JSON.stringify(cleaned)]);
-    const inserted = rows?.[0]?.inserted ?? 0;
+    if (event.httpMethod !== "POST") {
+      return json(405, { ok: false, error: "Method Not Allowed" });
+    }
 
-    return json(200, { ok: true, inserted });
-  } catch (err) {
-    return json(500, { ok: false, error: "Internal Server Error", message: String(err && err.message || err) });
+    // Auth (prod reality: token is required)
+    if (!checkToken(event)) {
+      return unauthorized();
+    }
+
+    // Parse & validate body
+    let payload;
+    try {
+      payload = parseBody(event);
+    } catch (e) {
+      return badRequest(e.message);
+    }
+
+    // Accept: { matches: [...] } OR [...]
+    const input = Array.isArray(payload) ? payload : payload?.matches;
+    if (!Array.isArray(input)) {
+      return badRequest("Body must be an array or {matches:[...]}");
+    }
+    if (input.length === 0) {
+      return json(200, { ok: true, import_batch_id: null, count: 0 });
+    }
+
+    // Normalize
+    let normalized;
+    try {
+      normalized = input.map(normalizeMatch);
+    } catch (e) {
+      return badRequest(e.message);
+    }
+
+    // DB insert with ONE import_batch_id for the whole call
+    const importBatchId = crypto.randomUUID();
+    const pool = getPool();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const text = `
+        INSERT INTO staging_matches (
+          import_batch_id,
+          league, home_team, away_team, kickoff_at, status, venue, metadata
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      `;
+      for (const m of normalized) {
+        const values = [
+          importBatchId,
+          m.league,
+          m.home_team,
+          m.away_team,
+          m.kickoff_at,
+          m.status,
+          m.venue,
+          JSON.stringify(m.metadata),
+        ];
+        await client.query(text, values);
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+      // Surface common constraint messages as-is to caller for faster ops
+      console.error("[import-to-staging] DB error:", e);
+      return internalError(e.message);
+    } finally {
+      client.release();
+    }
+
+    return json(200, {
+      ok: true,
+      import_batch_id: importBatchId,
+      count: normalized.length,
+    });
+  } catch (e) {
+    console.error("[import-to-staging] Fatal error:", e);
+    return internalError(e.message);
   }
-};
-
-function json(status, data) { return { statusCode: status, headers: corsHeaders, body: JSON.stringify(data) }; }
-function normStr(x) { if (typeof x !== "string") return null; const t = x.trim(); return t.length ? t : null; }
-function toInt(x) { const n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : null; }
+}
