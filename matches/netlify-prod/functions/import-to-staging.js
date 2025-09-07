@@ -1,7 +1,7 @@
 // matches/netlify-prod/functions/import-to-staging.js
 // POST: додає записи у staging_matches (без мерджу).
-// Тіло: масив матчів, або { matches: [...] }, або один об'єкт.
-// Робастний парсинг (base64, BOM), зрозумілі помилки.
+// Підтримує масив, {matches:[...]}, або один об'єкт.
+// Робастний парсинг (base64, BOM) + schema-heal перед INSERT.
 
 const { Pool } = require("pg");
 const ORIGIN = "https://football-m.netlify.app";
@@ -25,36 +25,32 @@ exports.handler = async (event) => {
     if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers: corsHeaders, body: "" };
     if (event.httpMethod !== "POST") return json(405, { ok: false, error: "Method Not Allowed" });
 
-    // Auth: той самий токен, що й у update-matches
+    // auth (як у update-matches)
     if (UPDATE_TOKEN) {
       const h = event.headers.authorization || event.headers.Authorization || "";
       const token = h.startsWith("Bearer ") ? h.slice(7).trim() : "";
       if (!token || token !== UPDATE_TOKEN) return json(401, { ok: false, error: "Unauthorized" });
     }
 
-    // --- Парсинг JSON (base64 + BOM safe) ---
+    // --- парсинг JSON (base64 + BOM safe) ---
     let raw = event.body || "";
     if (raw && event.isBase64Encoded) {
       try { raw = Buffer.from(raw, "base64").toString("utf8"); }
       catch { return json(400, { ok: false, error: "Invalid JSON body (b64 decode)" }); }
     }
-    if (raw && raw.charCodeAt && raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1); // зняти BOM
-
+    if (raw && raw.charCodeAt && raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
     let body = {};
     try { body = raw ? JSON.parse(raw) : {}; }
     catch { return json(400, { ok: false, error: "Invalid JSON body" }); }
 
-    // Нормалізація вхідних даних до масиву
+    // нормалізація до масиву
     let arr = [];
     if (Array.isArray(body)) arr = body;
     else if (body && Array.isArray(body.matches)) arr = body.matches;
     else if (body && typeof body === "object" && Object.keys(body).length) arr = [body];
+    if (!Array.isArray(arr) || arr.length === 0) return json(400, { ok: false, error: "No items provided" });
 
-    if (!Array.isArray(arr) || arr.length === 0) {
-      return json(400, { ok: false, error: "No items provided" });
-    }
-
-    // Мінімальна валідація + whitelist
+    // базовий whitelist + мінімальна валідація
     const cleaned = [];
     for (const it of arr) {
       if (!it || typeof it !== "object") continue;
@@ -70,15 +66,48 @@ exports.handler = async (event) => {
         tournament:      normStr(it.tournament),
         rank:            toInt(it.rank),
       };
-      // обов'язкові поля
       if (!item.kickoff_at || !item.home_team || !item.away_team) continue;
       cleaned.push(item);
     }
-    if (cleaned.length === 0) {
-      return json(400, { ok: false, error: "No valid items" });
-    }
+    if (cleaned.length === 0) return json(400, { ok: false, error: "No valid items" });
 
-    // Вставка: безпечна, без jsonb_to_recordset — через jsonb_array_elements + явні касти
+    // --- schema-heal: гарантуємо дефолти, щоби INSERT не падав ---
+    // робимо атомарно (BEGIN/COMMIT усередині, але це легкі ALTER/UPDATE)
+    await pool.query(`
+      DO $$
+      BEGIN
+        -- created_at: якщо нема — додаємо; ставимо DEFAULT now()
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='staging_matches' AND column_name='created_at'
+        ) THEN
+          ALTER TABLE staging_matches ADD COLUMN created_at timestamptz;
+        END IF;
+        -- import_batch_id: якщо нема — додаємо
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='staging_matches' AND column_name='import_batch_id'
+        ) THEN
+          ALTER TABLE staging_matches ADD COLUMN import_batch_id text;
+        END IF;
+        -- home_away_confidence: якщо нема — додаємо (nullable)
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='staging_matches' AND column_name='home_away_confidence'
+        ) THEN
+          ALTER TABLE staging_matches ADD COLUMN home_away_confidence real;
+        END IF;
+      END$$;
+
+      -- дефолти (якщо не встановлені)
+      ALTER TABLE staging_matches ALTER COLUMN imported_at SET DEFAULT now();
+      ALTER TABLE staging_matches ALTER COLUMN created_at  SET DEFAULT now();
+
+      -- заповнити наявні NULL значення
+      UPDATE staging_matches SET created_at = now() WHERE created_at IS NULL;
+    `);
+
+    // --- INSERT (без jsonb_to_recordset, із явними кастами) ---
     const q = `
       WITH src AS (SELECT $1::jsonb AS j),
       rows AS (
@@ -105,14 +134,12 @@ exports.handler = async (event) => {
       )
       SELECT COUNT(*)::int AS inserted FROM ins;
     `;
-
     const { rows } = await pool.query(q, [JSON.stringify(cleaned)]);
     const inserted = rows?.[0]?.inserted ?? 0;
 
     return json(200, { ok: true, inserted });
   } catch (err) {
-    console.error("[import-to-staging] Error:", err);
-    // Тимчасово повернемо повідомлення (ендпоїнт захищений токеном)
+    // Повертаємо повідомлення (ендпоїнт захищений токеном)
     return json(500, { ok: false, error: "Internal Server Error", message: String(err && err.message || err) });
   }
 };
