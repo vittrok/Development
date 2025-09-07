@@ -1,7 +1,7 @@
 // matches/netlify-prod/functions/import-to-staging.js
 // POST: додає записи у staging_matches (без мерджу).
-// Підтримує масив, {matches:[...]}, або один об'єкт.
-// Робастний парсинг (base64, BOM) + schema-heal перед INSERT.
+// Тіло: масив матчів, або { matches: [...] }, або один об'єкт.
+// Робастний парсинг (base64, BOM) + schema-heal + підтримка UUID для import_batch_id.
 
 const { Pool } = require("pg");
 const ORIGIN = "https://football-m.netlify.app";
@@ -25,14 +25,14 @@ exports.handler = async (event) => {
     if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers: corsHeaders, body: "" };
     if (event.httpMethod !== "POST") return json(405, { ok: false, error: "Method Not Allowed" });
 
-    // auth (як у update-matches)
+    // auth
     if (UPDATE_TOKEN) {
       const h = event.headers.authorization || event.headers.Authorization || "";
       const token = h.startsWith("Bearer ") ? h.slice(7).trim() : "";
       if (!token || token !== UPDATE_TOKEN) return json(401, { ok: false, error: "Unauthorized" });
     }
 
-    // --- парсинг JSON (base64 + BOM safe) ---
+    // robust body parsing
     let raw = event.body || "";
     if (raw && event.isBase64Encoded) {
       try { raw = Buffer.from(raw, "base64").toString("utf8"); }
@@ -43,14 +43,14 @@ exports.handler = async (event) => {
     try { body = raw ? JSON.parse(raw) : {}; }
     catch { return json(400, { ok: false, error: "Invalid JSON body" }); }
 
-    // нормалізація до масиву
+    // normalize to array
     let arr = [];
     if (Array.isArray(body)) arr = body;
     else if (body && Array.isArray(body.matches)) arr = body.matches;
     else if (body && typeof body === "object" && Object.keys(body).length) arr = [body];
     if (!Array.isArray(arr) || arr.length === 0) return json(400, { ok: false, error: "No items provided" });
 
-    // базовий whitelist + мінімальна валідація
+    // whitelist + minimal validation
     const cleaned = [];
     for (const it of arr) {
       if (!it || typeof it !== "object") continue;
@@ -61,7 +61,7 @@ exports.handler = async (event) => {
         home_team:       normStr(it.home_team),
         away_team:       normStr(it.away_team),
         source:          normStr(it.source),
-        import_batch_id: normStr(it.import_batch_id),
+        import_batch_id: normStr(it.import_batch_id), // може бути UUID або довільний текст
         link:            normStr(it.link),
         tournament:      normStr(it.tournament),
         rank:            toInt(it.rank),
@@ -71,26 +71,16 @@ exports.handler = async (event) => {
     }
     if (cleaned.length === 0) return json(400, { ok: false, error: "No valid items" });
 
-    // --- schema-heal: гарантуємо дефолти, щоби INSERT не падав ---
-    // робимо атомарно (BEGIN/COMMIT усередині, але це легкі ALTER/UPDATE)
+    // schema-heal: легкі дефолти, не чіпаємо типи колонок
     await pool.query(`
       DO $$
       BEGIN
-        -- created_at: якщо нема — додаємо; ставимо DEFAULT now()
         IF NOT EXISTS (
           SELECT 1 FROM information_schema.columns
           WHERE table_schema='public' AND table_name='staging_matches' AND column_name='created_at'
         ) THEN
           ALTER TABLE staging_matches ADD COLUMN created_at timestamptz;
         END IF;
-        -- import_batch_id: якщо нема — додаємо
-        IF NOT EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_schema='public' AND table_name='staging_matches' AND column_name='import_batch_id'
-        ) THEN
-          ALTER TABLE staging_matches ADD COLUMN import_batch_id text;
-        END IF;
-        -- home_away_confidence: якщо нема — додаємо (nullable)
         IF NOT EXISTS (
           SELECT 1 FROM information_schema.columns
           WHERE table_schema='public' AND table_name='staging_matches' AND column_name='home_away_confidence'
@@ -99,47 +89,89 @@ exports.handler = async (event) => {
         END IF;
       END$$;
 
-      -- дефолти (якщо не встановлені)
       ALTER TABLE staging_matches ALTER COLUMN imported_at SET DEFAULT now();
       ALTER TABLE staging_matches ALTER COLUMN created_at  SET DEFAULT now();
-
-      -- заповнити наявні NULL значення
       UPDATE staging_matches SET created_at = now() WHERE created_at IS NULL;
     `);
 
-    // --- INSERT (без jsonb_to_recordset, із явними кастами) ---
-    const q = `
-      WITH src AS (SELECT $1::jsonb AS j),
-      rows AS (
-        SELECT
-          NULLIF(elem->>'kickoff_at','')::timestamptz  AS kickoff_at,
-          NULLIF(elem->>'league','')                   AS league,
-          NULLIF(elem->>'status','')                   AS status,
-          NULLIF(elem->>'home_team','')                AS home_team,
-          NULLIF(elem->>'away_team','')                AS away_team,
-          NULLIF(elem->>'source','')                   AS source,
-          NULLIF(elem->>'import_batch_id','')          AS import_batch_id,
-          NULLIF(elem->>'link','')                     AS link,
-          NULLIF(elem->>'tournament','')               AS tournament,
-          NULLIF(elem->>'rank','')::int                AS rank
-        FROM src, jsonb_array_elements(src.j) elem
-      ),
-      ins AS (
-        INSERT INTO staging_matches
-          (kickoff_at, league, status, home_team, away_team, source, import_batch_id, link, tournament, rank)
-        SELECT kickoff_at, league, status, home_team, away_team, source, import_batch_id, link, tournament, rank
-        FROM rows
-        WHERE kickoff_at IS NOT NULL AND home_team IS NOT NULL AND away_team IS NOT NULL
-        RETURNING id
-      )
-      SELECT COUNT(*)::int AS inserted FROM ins;
-    `;
+    // дізнаємось тип колонки import_batch_id (uuid чи text)
+    const typRes = await pool.query(`
+      SELECT data_type
+      FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='staging_matches' AND column_name='import_batch_id'
+      LIMIT 1
+    `);
+    const importBatchIsUUID = (typRes.rows[0]?.data_type || "").toLowerCase() === "uuid";
+
+    // формуємо SQL із правильним кастом для import_batch_id
+    let q;
+    if (importBatchIsUUID) {
+      // Якщо колонка uuid: беремо лише валідні UUID, інакше NULL
+      q = `
+        WITH src AS (SELECT $1::jsonb AS j),
+        rows AS (
+          SELECT
+            NULLIF(elem->>'kickoff_at','')::timestamptz  AS kickoff_at,
+            NULLIF(elem->>'league','')                   AS league,
+            NULLIF(elem->>'status','')                   AS status,
+            NULLIF(elem->>'home_team','')                AS home_team,
+            NULLIF(elem->>'away_team','')                AS away_team,
+            NULLIF(elem->>'source','')                   AS source,
+            CASE
+              WHEN (elem->>'import_batch_id') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+                THEN (elem->>'import_batch_id')::uuid
+              ELSE NULL::uuid
+            END                                          AS import_batch_id,
+            NULLIF(elem->>'link','')                     AS link,
+            NULLIF(elem->>'tournament','')               AS tournament,
+            NULLIF(elem->>'rank','')::int                AS rank
+          FROM src, jsonb_array_elements(src.j) elem
+        ),
+        ins AS (
+          INSERT INTO staging_matches
+            (kickoff_at, league, status, home_team, away_team, source, import_batch_id, link, tournament, rank)
+          SELECT kickoff_at, league, status, home_team, away_team, source, import_batch_id, link, tournament, rank
+          FROM rows
+          WHERE kickoff_at IS NOT NULL AND home_team IS NOT NULL AND away_team IS NOT NULL
+          RETURNING id
+        )
+        SELECT COUNT(*)::int AS inserted FROM ins;
+      `;
+    } else {
+      // Колонка текстова або відсутня: вставляємо як text
+      q = `
+        WITH src AS (SELECT $1::jsonb AS j),
+        rows AS (
+          SELECT
+            NULLIF(elem->>'kickoff_at','')::timestamptz  AS kickoff_at,
+            NULLIF(elem->>'league','')                   AS league,
+            NULLIF(elem->>'status','')                   AS status,
+            NULLIF(elem->>'home_team','')                AS home_team,
+            NULLIF(elem->>'away_team','')                AS away_team,
+            NULLIF(elem->>'source','')                   AS source,
+            NULLIF(elem->>'import_batch_id','')          AS import_batch_id,
+            NULLIF(elem->>'link','')                     AS link,
+            NULLIF(elem->>'tournament','')               AS tournament,
+            NULLIF(elem->>'rank','')::int                AS rank
+          FROM src, jsonb_array_elements(src.j) elem
+        ),
+        ins AS (
+          INSERT INTO staging_matches
+            (kickoff_at, league, status, home_team, away_team, source, import_batch_id, link, tournament, rank)
+          SELECT kickoff_at, league, status, home_team, away_team, source, import_batch_id, link, tournament, rank
+          FROM rows
+          WHERE kickoff_at IS NOT NULL AND home_team IS NOT NULL AND away_team IS NOT NULL
+          RETURNING id
+        )
+        SELECT COUNT(*)::int AS inserted FROM ins;
+      `;
+    }
+
     const { rows } = await pool.query(q, [JSON.stringify(cleaned)]);
     const inserted = rows?.[0]?.inserted ?? 0;
 
     return json(200, { ok: true, inserted });
   } catch (err) {
-    // Повертаємо повідомлення (ендпоїнт захищений токеном)
     return json(500, { ok: false, error: "Internal Server Error", message: String(err && err.message || err) });
   }
 };
