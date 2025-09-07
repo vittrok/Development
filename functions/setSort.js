@@ -1,6 +1,5 @@
-// POST /set-sort
-// Архітектура v1.1: cookie-сесія (admin) + CSRF, базові rate limits, валідація payload
-// Зберігає налаштування сортування користувача (preferences.sort_col, preferences.sort_order).
+// POST /.netlify/functions/setSort
+// Архітектура v1.1: cookie-сесія (admin) + CSRF, м'які rate limits, валідація payload
 
 const { Pool } = require("pg");
 const crypto = require("crypto");
@@ -72,8 +71,7 @@ function verifyCsrfToken(sid, headerVal) {
 }
 
 // ==== Rate Limits (Fixed Window) ============================================
-// Таблиця: rate_limits(key PK, count int, reset_at timestamptz)
-// Налаштування для легкого state-change ендпоінта (м'якіші, ніж у /update-matches):
+// Для легкого mutation-ендпоінта ставимо м’які значення:
 // - Session: 5/60s
 // - IP:      20/60s
 // - Global:  100/60s
@@ -120,8 +118,7 @@ function getClientIp(event) {
 }
 
 // ==== Payload validation =====================================================
-// Узгоджена з архітектурою множина полів сортування.
-// Якщо у твоїй v1.1 є інший whitelist — скажи, піджену.
+// Якщо у твоєму v1.1 whitelist інший — підженемо в наступному кроці.
 const ALLOWED_COLS = new Set([
   "kickoff_at",
   "tournament",
@@ -142,7 +139,7 @@ exports.handler = async (event) => {
       return json(405, { ok: false, error: "Method Not Allowed" });
     }
 
-    // --- Parse body (JSON; і b64) ---
+    // --- Parse body (JSON; підтримка base64) ---
     const ctRaw = event.headers["content-type"] || event.headers["Content-Type"] || "";
     const ctype = ctRaw.split(";")[0].trim().toLowerCase();
     let raw = event.body || "";
@@ -151,7 +148,6 @@ exports.handler = async (event) => {
       catch { return json(400, { ok: false, error: "invalid_body_b64" }); }
     }
     if (ctype !== "application/json") {
-      // суворо просимо JSON
       return json(415, { ok: false, error: "unsupported_media_type" });
     }
     let body;
@@ -223,7 +219,7 @@ exports.handler = async (event) => {
 
       const userId = row.user_id;
 
-      // Rate limits: Session → IP → Global (м’які значення; за потреби відкоригуємо)
+      // Rate limits: Session → IP → Global
       const rlSess = await applyRateLimit(client, rlSessKey(sid), RL_SESS_LIMIT, RL_SESS_WINDOW_SEC);
       if (rlSess.limited) {
         await client.query("ROLLBACK");
@@ -257,13 +253,13 @@ exports.handler = async (event) => {
       return json(200, { ok: true, sort: { col: sort_col, order: sort_order } });
     } catch (e) {
       await client.query("ROLLBACK");
-      console.error("[set-sort] db error:", e);
+      console.error("[setSort] db error:", e);
       return json(500, { ok: false, error: "db_failed" });
     } finally {
       client.release();
     }
   } catch (e) {
-    console.error("[set-sort] fatal:", e);
+    console.error("[setSort] fatal:", e);
     return json(500, { ok: false, error: "internal" });
   }
 };
