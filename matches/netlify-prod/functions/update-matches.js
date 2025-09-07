@@ -1,7 +1,7 @@
 // POST /update-matches
-// Архітектурні вимоги v1.1: rate limits (global/IP), sync_lock, idempotency
+// Архітектурні вимоги v1.1: idempotency (перед rate-limits), rate limits (global/IP), sync_lock
 // Тимчасово збережено OUT-OF-ARCH X-Update-Token (альтернатива Authorization: Bearer)
-// Пізніше замінимо на cookie-сесії + CSRF (крок 7.3).
+// Далі (наступний крок) додамо cookie-сесії + CSRF.
 
 const { Pool } = require("pg");
 
@@ -44,8 +44,6 @@ const pool = new Pool({
 // ==== Helpers: client IP =====================================================
 function getClientIp(event) {
   const h = event.headers || {};
-  // Netlify typical headers:
-  // x-nf-client-connection-ip (single IP) or x-forwarded-for (list)
   const ip1 = h["x-nf-client-connection-ip"] || h["X-Nf-Client-Connection-Ip"];
   if (ip1) return String(ip1).trim();
   const xff = h["x-forwarded-for"] || h["X-Forwarded-For"];
@@ -54,9 +52,8 @@ function getClientIp(event) {
 }
 
 // ==== Rate Limit (Fixed Window) ==============================================
-// Tables per arch: rate_limits(key PK, count int, reset_at timestamptz)
-//
-// Policies for this endpoint (until cookie sessions land):
+// rate_limits(key PK, count int, reset_at timestamptz)
+// Policies:
 // - Global: 1/2m
 // - IP: 1/5m
 const RL_GLOBAL_KEY = "global:update-matches";
@@ -70,15 +67,10 @@ const RL_IP_LIMIT = 1;
 const RL_IP_WINDOW_SEC = 300;
 
 async function applyRateLimit(client, key, limit, windowSec) {
-  // Now (UTC)
   const resNow = await client.query("SELECT now() AS now");
   const now = new Date(resNow.rows[0].now);
   const resetAt = new Date(now.getTime() + windowSec * 1000);
 
-  // Upsert fixed window:
-  // - If existing and reset_at > now: increment count
-  // - If existing but window passed: reset count=1, reset_at = now + window
-  // - If new: insert count=1
   const upsert = await client.query(
     `
     INSERT INTO rate_limits(key, count, reset_at)
@@ -100,7 +92,6 @@ async function applyRateLimit(client, key, limit, windowSec) {
 
   const { count, reset_at } = upsert.rows[0];
   if (count > limit) {
-    // Too many requests; compute Retry-After
     const raSec = Math.max(
       1,
       Math.ceil((new Date(reset_at).getTime() - now.getTime()) / 1000)
@@ -111,9 +102,8 @@ async function applyRateLimit(client, key, limit, windowSec) {
 }
 
 // ==== Sync Lock via settings.sync_lock =======================================
-// settings(key PK text, value jsonb); key='sync_lock', value={ locked_till: timestamptz }
 const LOCK_KEY = "sync_lock";
-const LOCK_HOLD_SEC = 180; // 3 хв за архітектурою 3–5 хв
+const LOCK_HOLD_SEC = 180; // 3 хв
 
 async function loadLock(client) {
   const r = await client.query(
@@ -140,8 +130,6 @@ async function setLock(client, untilIso) {
 }
 
 // ==== Idempotency via sync_logs ==============================================
-// sync_logs(id PK, started_at, finished_at, status, inserted, updated, skipped,
-//           source, actor_user_id, idempotency_key, note/error)
 async function findByIdemKey(client, key) {
   if (!key) return null;
   const r = await client.query(
@@ -229,19 +217,35 @@ exports.handler = async (event) => {
     const source = normStr(body.source) || "manual";
     const import_batch_id = normStr(body.import_batch_id) || null;
 
-    // Idempotency
     const idemKey =
       normStr(event.headers["idempotency-key"]) ||
       normStr(event.headers["Idempotency-Key"]) ||
       "";
 
     const clientIp = getClientIp(event);
-
     const client = await pool.connect();
+
     try {
-      // 1) Rate limits (IP → Global)
       await client.query("BEGIN");
 
+      // 1) Idempotency-first: якщо є дубль — повертаємо попередній результат БЕЗ rate-limit
+      if (idemKey) {
+        const prev = await findByIdemKey(client, idemKey);
+        if (prev && prev.status === "ok") {
+          await client.query("COMMIT");
+          return json(200, {
+            ok: true,
+            duplicate: true,
+            result: {
+              inserted: Number(prev.inserted || 0),
+              updated: Number(prev.updated || 0),
+              skipped: Number(prev.skipped || 0),
+            },
+          });
+        }
+      }
+
+      // 2) Rate limits (IP → Global)
       const rlIp = await applyRateLimit(
         client,
         rlIpKey(clientIp),
@@ -250,7 +254,11 @@ exports.handler = async (event) => {
       );
       if (rlIp.limited) {
         await client.query("ROLLBACK");
-        return json(429, { ok: false, error: "rate_limited_ip" }, { "Retry-After": String(rlIp.retryAfter) });
+        return json(
+          429,
+          { ok: false, error: "rate_limited_ip" },
+          { "Retry-After": String(rlIp.retryAfter) }
+        );
       }
 
       const rlGlobal = await applyRateLimit(
@@ -261,20 +269,11 @@ exports.handler = async (event) => {
       );
       if (rlGlobal.limited) {
         await client.query("ROLLBACK");
-        return json(429, { ok: false, error: "rate_limited_global" }, { "Retry-After": String(rlGlobal.retryAfter) });
-      }
-
-      // 2) Idempotency quick check
-      if (idemKey) {
-        const prev = await findByIdemKey(client, idemKey);
-        if (prev && prev.status === "ok") {
-          await client.query("COMMIT");
-          return json(200, { ok: true, duplicate: true, result: {
-            inserted: prev.inserted || 0,
-            updated: prev.updated || 0,
-            skipped: prev.skipped || 0,
-          }});
-        }
+        return json(
+          429,
+          { ok: false, error: "rate_limited_global" },
+          { "Retry-After": String(rlGlobal.retryAfter) }
+        );
       }
 
       // 3) Sync Lock
@@ -287,7 +286,7 @@ exports.handler = async (event) => {
         await client.query("ROLLBACK");
         return json(204, { status: "locked_until", locked_till: lockedTill.toISOString() });
       }
-      // set new lock = now + LOCK_HOLD_SEC
+
       const until = new Date(now.getTime() + LOCK_HOLD_SEC * 1000).toISOString();
       await setLock(client, until);
 
@@ -302,12 +301,8 @@ exports.handler = async (event) => {
           [trigger_type, source, import_batch_id]
         );
 
-        // Очікуємо повертати total/inserted/updated/skipped (залежно від БД-функції)
         const row = res.rows?.[0] || null;
-
-        // Узгодимо поля лічильників з архітектурою (inserted/updated/skipped):
         if (row && row.run_staging_validate_and_merge) {
-          // Якщо БД повертає як composite
           const v = row.run_staging_validate_and_merge;
           counters = {
             inserted: Number(v.inserted || 0),
@@ -315,7 +310,6 @@ exports.handler = async (event) => {
             skipped: Number(v.skipped || 0),
           };
         } else {
-          // або пробуємо напряму з полів:
           counters = {
             inserted: Number(row?.inserted || 0),
             updated: Number(row?.updated || 0),
@@ -325,10 +319,15 @@ exports.handler = async (event) => {
 
         await updateSyncLogFinish(client, log.id, "ok", counters, "completed");
         await client.query("COMMIT");
-
         return json(200, { ok: true, result: counters });
       } catch (e) {
-        await updateSyncLogFinish(client, log.id, "failed", { inserted: 0, updated: 0, skipped: 0 }, String(e?.message || e));
+        await updateSyncLogFinish(
+          client,
+          log.id,
+          "failed",
+          { inserted: 0, updated: 0, skipped: 0 },
+          String(e?.message || e)
+        );
         await client.query("ROLLBACK");
         return json(500, { ok: false, error: "db_failed" });
       }
