@@ -1,6 +1,6 @@
 // matches/netlify-prod/functions/update-matches.js
 // POST: викликає run_staging_validate_and_merge(trigger_type, source, import_batch_id)
-// Працює і коли staging порожній (ідемпотентно).
+// Робастність: підтримує body як звичайний текст і як base64 (event.isBase64Encoded=true)
 
 const { Pool } = require("pg");
 
@@ -9,14 +9,16 @@ const corsHeaders = {
   "Access-Control-Allow-Credentials": "true",
   "Access-Control-Allow-Origin": ORIGIN,
   "Access-Control-Allow-Methods": "POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-CSRF",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization, X-Requested-With, X-CSRF",
   "Content-Type": "application/json; charset=utf-8",
   "Cache-Control": "no-cache",
   "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
 };
 
-const connectionString = process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
-const UPDATE_TOKEN = process.env.UPDATE_TOKEN || null; // якщо задано — вимагаємо Bearer токен
+const connectionString =
+  process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
+const UPDATE_TOKEN = process.env.UPDATE_TOKEN || null;
 
 const pool = new Pool({
   connectionString,
@@ -32,27 +34,42 @@ exports.handler = async (event) => {
       return json(405, { ok: false, error: "Method Not Allowed" });
     }
 
-    // Простий захист: якщо UPDATE_TOKEN задано — вимагаємо Authorization: Bearer <token>
+    // Простий захист токеном, якщо заданий
     if (UPDATE_TOKEN) {
-      const auth = event.headers.authorization || event.headers.Authorization || "";
-      const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
+      const auth =
+        event.headers.authorization ||
+        event.headers.Authorization ||
+        "";
+      const token = auth.startsWith("Bearer ")
+        ? auth.slice("Bearer ".length).trim()
+        : "";
       if (!token || token !== UPDATE_TOKEN) {
         return json(401, { ok: false, error: "Unauthorized" });
       }
     }
 
-    let body = {};
-    if (event.body) {
+    // --- Робастний парсинг JSON ---
+    let raw = event.body || "";
+    if (raw && event.isBase64Encoded) {
       try {
-        body = JSON.parse(event.body);
+        raw = Buffer.from(raw, "base64").toString("utf8");
+      } catch (_) {
+        return json(400, { ok: false, error: "Invalid JSON body (b64 decode)" });
+      }
+    }
+
+    let body = {};
+    if (raw) {
+      try {
+        body = JSON.parse(raw);
       } catch {
         return json(400, { ok: false, error: "Invalid JSON body" });
       }
     }
 
-    const trigger_type = normStr(body.trigger_type) || "manual";        // 'manual' | 'cron'
-    const source       = normStr(body.source)       || null;             // довільний ідентифікатор джерела
-    const importBatch  = normStr(body.import_batch_id) || null;          // довільний batch-id
+    const trigger_type = normStr(body.trigger_type) || "manual"; // 'manual' | 'cron'
+    const source = normStr(body.source) || null;
+    const importBatch = normStr(body.import_batch_id) || null;
 
     const { rows } = await pool.query(
       `SELECT run_staging_validate_and_merge($1,$2,$3) AS result`,
@@ -73,7 +90,6 @@ exports.handler = async (event) => {
 function json(status, data) {
   return { statusCode: status, headers: corsHeaders, body: JSON.stringify(data) };
 }
-
 function normStr(x) {
   if (typeof x !== "string") return null;
   const t = x.trim();
