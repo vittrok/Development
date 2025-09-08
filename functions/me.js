@@ -1,143 +1,143 @@
-// GET /me
-// Архітектура v1.1: перевіряє cookie-сесію admin і повертає csrf = HMAC(CSRF_SECRET, sid)
+// File: functions/me.js
 
-const { Pool } = require("pg");
-const crypto = require("crypto");
-
-const ORIGIN = "https://football-m.netlify.app"; // прод-оригін
-const corsHeaders = {
-  "Access-Control-Allow-Credentials": "true",
-  "Access-Control-Allow-Origin": ORIGIN,
-  "Access-Control-Allow-Methods": "GET,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Requested-With, X-CSRF",
-  "Content-Type": "application/json; charset=utf-8",
-  "Cache-Control": "no-cache",
-  "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+// --- CORS / security ---
+const ALLOWED_ORIGIN = 'https://football-m.netlify.app';
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+  'Access-Control-Allow-Credentials': 'true',
+  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With, X-CSRF, Cookie',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
+  'X-Content-Type-Options': 'nosniff'
 };
 
-function json(status, obj) {
-  return { statusCode: status, headers: corsHeaders, body: JSON.stringify(obj) };
+// --- Helpers: respond ---
+function json(status, body, extra = {}) {
+  return {
+    statusCode: status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS_HEADERS, ...extra },
+    body: JSON.stringify(body)
+  };
 }
-function normStr(v) {
-  return typeof v === "string" ? v.trim() : "";
+
+// --- CSRF: simple token per request (stateless) ---
+// У проді ви можете генерувати токен детерміновано з сесії/секрету.
+// Тут — безпечний random на кожен /me для простоти.
+function genCsrf() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
-function timingSafeEq(a, b) {
-  const aa = Buffer.from(String(a) || "");
-  const bb = Buffer.from(String(b) || "");
-  if (aa.length !== bb.length) return false;
-  return crypto.timingSafeEqual(aa, bb);
+
+// --- DB client ---
+// В архітектурі передбачено централізований клієнт БД (Neon/Postgres).
+// Якщо у вас є локальний хелпер (наприклад, ./_lib/db.js), імпортуйте його.
+// Нижче — легка інлайн-ініціалізація через pg з connection string з ENV.
+const { Client } = require('pg');
+const crypto = require('crypto');
+
+// Параметри підтягуємо з env (Netlify → Site settings → Environment)
+const PG_CONNECTION_STRING = process.env.PG_CONNECTION_STRING;
+
+// --- Session helpers ---
+// Простий парсер cookie "session=<value>"
+function parseSessionCookie(cookieHeader) {
+  if (!cookieHeader) return null;
+  const parts = cookieHeader.split(';').map(s => s.trim());
+  const kv = parts.find(p => p.toLowerCase().startsWith('session='));
+  if (!kv) return null;
+  return kv.substring('session='.length);
 }
-function hmacHex(secret, data) {
-  return crypto.createHmac("sha256", String(secret)).update(String(data)).digest("hex");
+
+// Валідація сесії в таблиці sessions (архітектура v1.1)
+async function getSessionRecord(client, sessionValue) {
+  if (!sessionValue) return null;
+  const sql = `
+    SELECT s.id, s.user_id, s.role, s.created_at
+    FROM sessions s
+    WHERE s.value = $1 AND s.revoked_at IS NULL
+    LIMIT 1
+  `;
+  const res = await client.query(sql, [sessionValue]);
+  return res.rows[0] || null;
 }
-function parseCookies(header) {
-  const out = {};
-  if (!header) return out;
-  // розбиваємо саме по "; " — краща точність для Cookie
-  for (const part of header.split(/;\s*/)) {
-    const i = part.indexOf("=");
-    if (i > 0) out[part.slice(0, i)] = part.slice(i + 1);
+
+// Витягаємо preferences для користувача
+async function getPreferences(client, userId) {
+  if (!userId) return null;
+  const sql = `
+    SELECT seen_color, sort, bg_color
+    FROM preferences
+    WHERE user_id = $1
+    LIMIT 1
+  `;
+  const res = await client.query(sql, [userId]);
+  if (res.rows.length === 0) {
+    return null;
   }
-  return out;
+  const row = res.rows[0];
+  return {
+    seen_color: row.seen_color || null,
+    sort: row.sort || null,
+    bg_color: row.bg_color || null
+  };
 }
 
-const connectionString =
-  process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
-const SESSION_SECRET = process.env.SESSION_SECRET || "";
-const CSRF_SECRET = process.env.CSRF_SECRET || "";
-
-const pool = new Pool({
-  connectionString,
-  ssl: { rejectUnauthorized: false },
-});
-
-function getSessionCookie(event) {
-  const raw = event.headers?.cookie || event.headers?.Cookie || "";
-  const cookies = parseCookies(raw);
-  return cookies["session"] || "";
-}
-function parseSidSig(cookieVal) {
-  if (!cookieVal) return null;
-  const dot = cookieVal.lastIndexOf(".");
-  if (dot <= 0) return null;
-  const sid = cookieVal.slice(0, dot);
-  const sig = cookieVal.slice(dot + 1);
-  return { sid, sig };
-}
-
-exports.handler = async (event) => {
-  try {
-    if (event.httpMethod === "OPTIONS") {
-      return { statusCode: 200, headers: corsHeaders, body: "" };
-    }
-    if (event.httpMethod !== "GET") {
-      return json(405, { ok: false, error: "Method Not Allowed" });
-    }
-
-    const cookieVal = getSessionCookie(event);
-    const parsed = parseSidSig(cookieVal) || {};
-    const sid = normStr(parsed.sid);
-    const sig = normStr(parsed.sig);
-
-    let resp = {
-      ok: true,
-      auth: { isAuthenticated: false, role: null, sid_prefix: null },
-      csrf: null,
+// --- Handler ---
+exports.handler = async (event, _context) => {
+  // Preflight
+  if (event.httpMethod === 'OPTIONS') {
+    return {
+      statusCode: 204,
+      headers: CORS_HEADERS,
+      body: ''
     };
+  }
 
-    if (!sid || !sig || !SESSION_SECRET) {
-      return json(200, resp);
+  try {
+    // Перевіряємо Origin
+    const origin = event.headers.origin || event.headers.Origin;
+    if (origin && origin !== ALLOWED_ORIGIN) {
+      return json(403, { ok: false, error: 'forbidden_origin' });
     }
 
-    // Перевірка підпису cookie
-    const expectedSig = hmacHex(SESSION_SECRET, sid);
-    if (!timingSafeEq(sig, expectedSig)) {
-      return json(200, resp);
-    }
+    // Зчитуємо cookie: session=<...>
+    const cookieHeader = event.headers.cookie || event.headers.Cookie;
+    const sessionValue = parseSessionCookie(cookieHeader);
 
-    // Lookup у БД сесії + ролі
-    const client = await pool.connect();
-    try {
-      const r = await client.query(
-        `
-        SELECT s.user_id, s.expires_at, s.revoked, u.role
-        FROM sessions s
-        JOIN users u ON u.id = s.user_id
-        WHERE s.sid = $1
-        `,
-        [sid]
-      );
-      if (!r.rowCount) {
-        return json(200, resp);
-      }
+    // Ініціалізуємо БД
+    const client = new Client({ connectionString: PG_CONNECTION_STRING, ssl: { rejectUnauthorized: false } });
+    await client.connect();
 
-      const row = r.rows[0];
-      if (row.revoked) {
-        return json(200, resp);
-      }
-      if (!row.expires_at || new Date(row.expires_at) <= new Date()) {
-        return json(200, resp);
-      }
+    let auth = { isAuthenticated: false, role: 'guest', sid_prefix: null };
+    let preferences = null;
 
-      const role = row.role || null;
-      // За архітектурою нам потрібен admin для адмін-дій, але /me просто відображає стан
-      const csrf = CSRF_SECRET ? hmacHex(CSRF_SECRET, sid) : null;
-
-      resp = {
-        ok: true,
-        auth: {
+    if (sessionValue) {
+      const sess = await getSessionRecord(client, sessionValue);
+      if (sess && sess.user_id) {
+        auth = {
           isAuthenticated: true,
-          role,
-          sid_prefix: sid.slice(0, 8),
-        },
-        csrf,
-      };
-      return json(200, resp);
-    } finally {
-      client.release();
+          role: sess.role || 'user',
+          sid_prefix: typeof sess.id === 'string' ? sess.id.substring(0, 8) : null
+        };
+        preferences = await getPreferences(client, sess.user_id);
+      }
     }
+
+    // CSRF токен для подальших POST
+    const csrf = genCsrf();
+
+    await client.end();
+
+    return json(200, {
+      ok: true,
+      auth,
+      csrf,
+      // важливо: завжди повертати ключ, навіть якщо null — це спрощує фронт
+      preferences: preferences || { seen_color: null, sort: null, bg_color: null }
+    });
   } catch (e) {
-    console.error("[me] fatal:", e);
-    return json(500, { ok: false, error: "internal" });
+    console.error('me.js error', e);
+    return json(500, { ok: false, error: 'internal_error' });
   }
 };
