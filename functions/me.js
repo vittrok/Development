@@ -1,130 +1,167 @@
-// File: functions/me.js
+// GET /me
+// Архітектура v1.1:
+// - Перевірка cookie-сесії admin (sid.sig) з підписом через SESSION_SECRET
+// - csrf = HMAC(CSRF_SECRET, sid)
+// - Повертаємо мінімальний профіль + preferences (seen_color, sort, bg_color)
 
-// --- Security / CORS ---
-const ALLOWED_ORIGIN = 'https://football-m.netlify.app';
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-  'Access-Control-Allow-Credentials': 'true',
-  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With, X-CSRF, Cookie',
-  'Referrer-Policy': 'strict-origin-when-cross-origin',
-  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
-  'X-Content-Type-Options': 'nosniff'
+const { Pool } = require("pg");
+const crypto = require("crypto");
+
+const ORIGIN = "https://football-m.netlify.app"; // прод-оригін
+const corsHeaders = {
+  "Access-Control-Allow-Credentials": "true",
+  "Access-Control-Allow-Origin": ORIGIN,
+  "Access-Control-Allow-Methods": "GET,OPTIONS",
+  // Вирівняно з іншими функціями: дозволяємо "Cookie"
+  "Access-Control-Allow-Headers": "Content-Type, X-Requested-With, X-CSRF, Cookie",
+  "Content-Type": "application/json; charset=utf-8",
+  "Cache-Control": "no-cache",
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
 };
 
-function json(status, body, extra = {}) {
-  return {
-    statusCode: status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS_HEADERS, ...extra },
-    body: JSON.stringify(body)
-  };
+function json(status, obj) {
+  return { statusCode: status, headers: corsHeaders, body: JSON.stringify(obj) };
 }
-
-const { Client } = require('pg');
-const nodeCrypto = require('crypto');
-
-// Node.js-варіант генерації CSRF
-function genCsrf() {
-  return nodeCrypto.randomBytes(32).toString('hex');
+function normStr(v) {
+  return typeof v === "string" ? v.trim() : "";
 }
-
-// ENV → Netlify → Site settings → Environment
-const PG_CONNECTION_STRING = process.env.PG_CONNECTION_STRING;
-
-// --- helpers ---
-function parseSessionCookie(cookieHeader) {
-  if (!cookieHeader) return null;
-  const parts = cookieHeader.split(';').map(s => s.trim());
-  const kv = parts.find(p => p.toLowerCase().startsWith('session='));
-  if (!kv) return null;
-  return kv.substring('session='.length);
+function timingSafeEq(a, b) {
+  const aa = Buffer.from(String(a) || "");
+  const bb = Buffer.from(String(b) || "");
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
 }
-
-async function getSessionRecord(client, sessionValue) {
-  if (!sessionValue) return null;
-  const sql = `
-    SELECT s.id, s.user_id, s.role, s.created_at
-    FROM sessions s
-    WHERE s.value = $1 AND s.revoked_at IS NULL
-    LIMIT 1
-  `;
-  const res = await client.query(sql, [sessionValue]);
-  return res.rows[0] || null;
+function hmacHex(secret, data) {
+  return crypto.createHmac("sha256", String(secret)).update(String(data)).digest("hex");
 }
-
-async function getPreferences(client, userId) {
-  if (!userId) return null;
-  const sql = `
-    SELECT seen_color, sort, bg_color
-    FROM preferences
-    WHERE user_id = $1
-    LIMIT 1
-  `;
-  const res = await client.query(sql, [userId]);
-  if (res.rows.length === 0) {
-    return null;
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const part of header.split(/;\s*/)) {
+    const i = part.indexOf("=");
+    if (i > 0) out[part.slice(0, i)] = part.slice(i + 1);
   }
-  const row = res.rows[0];
-  return {
-    seen_color: row.seen_color || null,
-    sort: row.sort || null,
-    bg_color: row.bg_color || null
-  };
+  return out;
 }
 
-// --- handler ---
-exports.handler = async (event, _context) => {
-  // preflight
-  if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: CORS_HEADERS, body: '' };
-  }
+const connectionString =
+  process.env.DATABASE_URL || process.env.NEON_DATABASE_URL || process.env.PG_CONNECTION_STRING || "";
+const SESSION_SECRET = process.env.SESSION_SECRET || "";
+const CSRF_SECRET = process.env.CSRF_SECRET || "";
 
+const pool = new Pool({
+  connectionString,
+  ssl: { rejectUnauthorized: false },
+});
+
+function getSessionCookie(event) {
+  const raw = event.headers?.cookie || event.headers?.Cookie || "";
+  const cookies = parseCookies(raw);
+  return cookies["session"] || "";
+}
+function parseSidSig(cookieVal) {
+  if (!cookieVal) return null;
+  const dot = cookieVal.lastIndexOf(".");
+  if (dot <= 0) return null;
+  const sid = cookieVal.slice(0, dot);
+  const sig = cookieVal.slice(dot + 1);
+  return { sid, sig };
+}
+
+exports.handler = async (event) => {
   try {
-    // Origin guard
-    const origin = event.headers.origin || event.headers.Origin;
-    if (origin && origin !== ALLOWED_ORIGIN) {
-      return json(403, { ok: false, error: 'forbidden_origin' });
+    if (event.httpMethod === "OPTIONS") {
+      return { statusCode: 200, headers: corsHeaders, body: "" };
+    }
+    if (event.httpMethod !== "GET") {
+      return json(405, { ok: false, error: "Method Not Allowed" });
     }
 
-    const cookieHeader = event.headers.cookie || event.headers.Cookie;
-    const sessionValue = parseSessionCookie(cookieHeader);
+    const cookieVal = getSessionCookie(event);
+    const parsed = parseSidSig(cookieVal) || {};
+    const sid = normStr(parsed.sid);
+    const sig = normStr(parsed.sig);
 
-    // DB connect
-    const client = new Client({
-      connectionString: PG_CONNECTION_STRING,
-      // Neon/PG на Netlify: зазвичай вимагає SSL; відсутність кореневих сертифікатів -> rejectUnauthorized:false
-      ssl: { rejectUnauthorized: false }
-    });
-    await client.connect();
-
-    let auth = { isAuthenticated: false, role: 'guest', sid_prefix: null };
-    let preferences = null;
-
-    if (sessionValue) {
-      const sess = await getSessionRecord(client, sessionValue);
-      if (sess && sess.user_id) {
-        auth = {
-          isAuthenticated: true,
-          role: sess.role || 'user',
-          sid_prefix: typeof sess.id === 'string' ? sess.id.substring(0, 8) : null
-        };
-        preferences = await getPreferences(client, sess.user_id);
-      }
-    }
-
-    const csrf = genCsrf();
-
-    await client.end();
-
-    return json(200, {
+    // Базова відповідь: завжди віддаємо ключ preferences (null-и за замовчуванням)
+    let resp = {
       ok: true,
-      auth,
-      csrf,
-      // завжди віддаємо ключ, навіть якщо немає запису в БД
-      preferences: preferences || { seen_color: null, sort: null, bg_color: null }
-    });
+      auth: { isAuthenticated: false, role: null, sid_prefix: null },
+      csrf: null,
+      preferences: { seen_color: null, sort: null, bg_color: null },
+    };
+
+    // Якщо немає необхідних секретів / підпису — не автентифікований стан
+    if (!sid || !sig || !SESSION_SECRET) {
+      return json(200, resp);
+    }
+
+    // Перевірка підпису cookie: sig == HMAC(SESSION_SECRET, sid)
+    const expectedSig = hmacHex(SESSION_SECRET, sid);
+    if (!timingSafeEq(sig, expectedSig)) {
+      return json(200, resp);
+    }
+
+    // Lookup у БД: сесія + роль користувача
+    const client = await pool.connect();
+    try {
+      const r = await client.query(
+        `
+        SELECT s.user_id, s.expires_at, s.revoked, u.role
+        FROM sessions s
+        JOIN users u ON u.id = s.user_id
+        WHERE s.sid = $1
+        `,
+        [sid]
+      );
+      if (!r.rowCount) {
+        return json(200, resp);
+      }
+
+      const row = r.rows[0];
+      if (row.revoked) {
+        return json(200, resp);
+      }
+      if (!row.expires_at || new Date(row.expires_at) <= new Date()) {
+        return json(200, resp);
+      }
+
+      // CSRF як HMAC(CSRF_SECRET, sid) (як в архітектурі)
+      const csrf = CSRF_SECRET ? hmacHex(CSRF_SECRET, sid) : null;
+
+      // Підтягнути preferences для user_id
+      let seen_color = null, sort = null, bg_color = null;
+      const pr = await client.query(
+        `
+        SELECT seen_color, sort, bg_color
+        FROM preferences
+        WHERE user_id = $1
+        LIMIT 1
+        `,
+        [row.user_id]
+      );
+      if (pr.rowCount) {
+        const p = pr.rows[0] || {};
+        seen_color = p.seen_color || null;
+        sort = p.sort || null;
+        bg_color = p.bg_color || null;
+      }
+
+      resp = {
+        ok: true,
+        auth: {
+          isAuthenticated: true,
+          role: row.role || null,
+          sid_prefix: sid.slice(0, 8),
+        },
+        csrf,
+        preferences: { seen_color, sort, bg_color },
+      };
+      return json(200, resp);
+    } finally {
+      client.release();
+    }
   } catch (e) {
-    console.error('me.js error', e);
-    return json(500, { ok: false, error: 'internal_error' });
+    console.error("[me] fatal:", e);
+    return json(500, { ok: false, error: "internal" });
   }
 };
