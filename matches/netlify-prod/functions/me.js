@@ -1,6 +1,6 @@
 // File: functions/me.js
 
-// --- CORS / security ---
+// --- Security / CORS ---
 const ALLOWED_ORIGIN = 'https://football-m.netlify.app';
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
@@ -12,7 +12,6 @@ const CORS_HEADERS = {
   'X-Content-Type-Options': 'nosniff'
 };
 
-// --- Helpers: respond ---
 function json(status, body, extra = {}) {
   return {
     statusCode: status,
@@ -21,26 +20,18 @@ function json(status, body, extra = {}) {
   };
 }
 
-// --- CSRF: simple token per request (stateless) ---
-// У проді ви можете генерувати токен детерміновано з сесії/секрету.
-// Тут — безпечний random на кожен /me для простоти.
+const { Client } = require('pg');
+const nodeCrypto = require('crypto');
+
+// Node.js-варіант генерації CSRF
 function genCsrf() {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  return nodeCrypto.randomBytes(32).toString('hex');
 }
 
-// --- DB client ---
-// В архітектурі передбачено централізований клієнт БД (Neon/Postgres).
-// Якщо у вас є локальний хелпер (наприклад, ./_lib/db.js), імпортуйте його.
-// Нижче — легка інлайн-ініціалізація через pg з connection string з ENV.
-const { Client } = require('pg');
-const crypto = require('crypto');
-
-// Параметри підтягуємо з env (Netlify → Site settings → Environment)
+// ENV → Netlify → Site settings → Environment
 const PG_CONNECTION_STRING = process.env.PG_CONNECTION_STRING;
 
-// --- Session helpers ---
-// Простий парсер cookie "session=<value>"
+// --- helpers ---
 function parseSessionCookie(cookieHeader) {
   if (!cookieHeader) return null;
   const parts = cookieHeader.split(';').map(s => s.trim());
@@ -49,7 +40,6 @@ function parseSessionCookie(cookieHeader) {
   return kv.substring('session='.length);
 }
 
-// Валідація сесії в таблиці sessions (архітектура v1.1)
 async function getSessionRecord(client, sessionValue) {
   if (!sessionValue) return null;
   const sql = `
@@ -62,7 +52,6 @@ async function getSessionRecord(client, sessionValue) {
   return res.rows[0] || null;
 }
 
-// Витягаємо preferences для користувача
 async function getPreferences(client, userId) {
   if (!userId) return null;
   const sql = `
@@ -83,30 +72,29 @@ async function getPreferences(client, userId) {
   };
 }
 
-// --- Handler ---
+// --- handler ---
 exports.handler = async (event, _context) => {
-  // Preflight
+  // preflight
   if (event.httpMethod === 'OPTIONS') {
-    return {
-      statusCode: 204,
-      headers: CORS_HEADERS,
-      body: ''
-    };
+    return { statusCode: 204, headers: CORS_HEADERS, body: '' };
   }
 
   try {
-    // Перевіряємо Origin
+    // Origin guard
     const origin = event.headers.origin || event.headers.Origin;
     if (origin && origin !== ALLOWED_ORIGIN) {
       return json(403, { ok: false, error: 'forbidden_origin' });
     }
 
-    // Зчитуємо cookie: session=<...>
     const cookieHeader = event.headers.cookie || event.headers.Cookie;
     const sessionValue = parseSessionCookie(cookieHeader);
 
-    // Ініціалізуємо БД
-    const client = new Client({ connectionString: PG_CONNECTION_STRING, ssl: { rejectUnauthorized: false } });
+    // DB connect
+    const client = new Client({
+      connectionString: PG_CONNECTION_STRING,
+      // Neon/PG на Netlify: зазвичай вимагає SSL; відсутність кореневих сертифікатів -> rejectUnauthorized:false
+      ssl: { rejectUnauthorized: false }
+    });
     await client.connect();
 
     let auth = { isAuthenticated: false, role: 'guest', sid_prefix: null };
@@ -124,7 +112,6 @@ exports.handler = async (event, _context) => {
       }
     }
 
-    // CSRF токен для подальших POST
     const csrf = genCsrf();
 
     await client.end();
@@ -133,7 +120,7 @@ exports.handler = async (event, _context) => {
       ok: true,
       auth,
       csrf,
-      // важливо: завжди повертати ключ, навіть якщо null — це спрощує фронт
+      // завжди віддаємо ключ, навіть якщо немає запису в БД
       preferences: preferences || { seen_color: null, sort: null, bg_color: null }
     });
   } catch (e) {
