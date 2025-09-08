@@ -1,11 +1,10 @@
 // File: public/prefs-init.js
-// Архітектура v1.1: ініціалізація користувацьких преференсів на ранньому етапі.
-// Мета: підтягнути seen_color і застосувати його до "seen"-елементів.
-// Працює без залежностей і до основного бандла (main.js).
+// Архітектура v1.1: ініціалізація користувацьких преференсів на старті.
+// Підтягує seen_color і застосовує його до "seen"-елементів.
 
 (function () {
   const ORIGIN = 'https://football-m.netlify.app';
-  const SEEN_FALLBACK = '#bbf7d0'; // м'ятний як запасний варіант
+  const SEEN_FALLBACK = '#bbf7d0'; // запасний колір
 
   async function fetchPreferences() {
     try {
@@ -20,10 +19,10 @@
 
   function applySeenColor(hex) {
     const color = (typeof hex === 'string' && hex.trim()) ? hex.trim() : SEEN_FALLBACK;
-    // 1) Виставляємо CSS-змінну
+    // 1) CSS-змінна на :root
     document.documentElement.style.setProperty('--seen-color', color);
 
-    // 2) Мінімальний стиль для "seen" (з високим пріоритетом, але акуратно)
+    // 2) Мінімальний стиль для "seen"
     const style = document.createElement('style');
     style.setAttribute('data-prefs-style', 'seen-color');
     style.textContent = `
@@ -32,7 +31,6 @@
         transition: background-color .2s ease;
       }
     `;
-    // Уникаємо дублювання якщо скрипт підключиться двічі
     const existing = document.head.querySelector('style[data-prefs-style="seen-color"]');
     if (existing) existing.remove();
     document.head.appendChild(style);
