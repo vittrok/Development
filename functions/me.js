@@ -1,8 +1,9 @@
+// File: functions/me.js
 // GET /me
 // Архітектура v1.1:
-// - Перевірка cookie-сесії admin (sid.sig) з підписом через SESSION_SECRET
+// - Перевірка cookie-сесії (sid.sig) з підписом через SESSION_SECRET
 // - csrf = HMAC(CSRF_SECRET, sid)
-// - Повертаємо мінімальний профіль + preferences (seen_color, sort, bg_color)
+// - Повертаємо мінімальний профіль + preferences (seen_color, sort_col, sort_order)
 
 const { Pool } = require("pg");
 const crypto = require("crypto");
@@ -12,7 +13,7 @@ const corsHeaders = {
   "Access-Control-Allow-Credentials": "true",
   "Access-Control-Allow-Origin": ORIGIN,
   "Access-Control-Allow-Methods": "GET,OPTIONS",
-  // Вирівняно з іншими функціями: дозволяємо "Cookie"
+  // Вирівняно з іншими функціями: дозволяємо Cookie
   "Access-Control-Allow-Headers": "Content-Type, X-Requested-With, X-CSRF, Cookie",
   "Content-Type": "application/json; charset=utf-8",
   "Cache-Control": "no-cache",
@@ -44,10 +45,15 @@ function parseCookies(header) {
   return out;
 }
 
+// Підтримуємо всі можливі назви змінних згідно з архітектурою/деплоєм
 const connectionString =
-  process.env.DATABASE_URL || process.env.NEON_DATABASE_URL || process.env.PG_CONNECTION_STRING || "";
+  process.env.DATABASE_URL ||
+  process.env.NEON_DATABASE_URL ||
+  process.env.PG_CONNECTION_STRING ||
+  "";
+
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
-const CSRF_SECRET = process.env.CSRF_SECRET || "";
+const CSRF_SECRET    = process.env.CSRF_SECRET    || "";
 
 const pool = new Pool({
   connectionString,
@@ -82,15 +88,15 @@ exports.handler = async (event) => {
     const sid = normStr(parsed.sid);
     const sig = normStr(parsed.sig);
 
-    // Базова відповідь: завжди віддаємо ключ preferences (null-и за замовчуванням)
+    // Базова відповідь: завжди віддаємо preferences-ключ з дефолтами
     let resp = {
       ok: true,
       auth: { isAuthenticated: false, role: null, sid_prefix: null },
       csrf: null,
-      preferences: { seen_color: null, sort: null, bg_color: null },
+      preferences: { seen_color: null, sort_col: null, sort_order: null },
     };
 
-    // Якщо немає необхідних секретів / підпису — не автентифікований стан
+    // Якщо немає необхідних секретів / підпису — гість
     if (!sid || !sig || !SESSION_SECRET) {
       return json(200, resp);
     }
@@ -101,9 +107,9 @@ exports.handler = async (event) => {
       return json(200, resp);
     }
 
-    // Lookup у БД: сесія + роль користувача
     const client = await pool.connect();
     try {
+      // 1) Валідація сесії
       const r = await client.query(
         `
         SELECT s.user_id, s.expires_at, s.revoked, u.role
@@ -113,37 +119,36 @@ exports.handler = async (event) => {
         `,
         [sid]
       );
-      if (!r.rowCount) {
-        return json(200, resp);
-      }
+      if (!r.rowCount) return json(200, resp);
 
       const row = r.rows[0];
-      if (row.revoked) {
-        return json(200, resp);
-      }
-      if (!row.expires_at || new Date(row.expires_at) <= new Date()) {
-        return json(200, resp);
-      }
+      if (row.revoked) return json(200, resp);
+      if (!row.expires_at || new Date(row.expires_at) <= new Date()) return json(200, resp);
 
-      // CSRF як HMAC(CSRF_SECRET, sid) (як в архітектурі)
+      // 2) CSRF = HMAC(CSRF_SECRET, sid)
       const csrf = CSRF_SECRET ? hmacHex(CSRF_SECRET, sid) : null;
 
-      // Підтягнути preferences для user_id
-      let seen_color = null, sort = null, bg_color = null;
-      const pr = await client.query(
-        `
-        SELECT seen_color, sort, bg_color
-        FROM preferences
-        WHERE user_id = $1
-        LIMIT 1
-        `,
-        [row.user_id]
-      );
-      if (pr.rowCount) {
-        const p = pr.rows[0] || {};
-        seen_color = p.seen_color || null;
-        sort = p.sort || null;
-        bg_color = p.bg_color || null;
+      // 3) Preferences: згідно з вашою фактичною схемою (sort_col, sort_order, seen_color)
+      let seen_color = null, sort_col = null, sort_order = null;
+      try {
+        const pr = await client.query(
+          `
+          SELECT seen_color, sort_col, sort_order
+          FROM preferences
+          WHERE user_id = $1
+          LIMIT 1
+          `,
+          [row.user_id]
+        );
+        if (pr.rowCount) {
+          const p = pr.rows[0] || {};
+          seen_color = p.seen_color || null;
+          sort_col   = p.sort_col   || null;
+          sort_order = p.sort_order || null;
+        }
+      } catch (prefErr) {
+        console.error("[me] preferences read failed:", prefErr);
+        // не валимо весь /me; клієнту — дефолтні префи
       }
 
       resp = {
@@ -154,7 +159,7 @@ exports.handler = async (event) => {
           sid_prefix: sid.slice(0, 8),
         },
         csrf,
-        preferences: { seen_color, sort, bg_color },
+        preferences: { seen_color, sort_col, sort_order },
       };
       return json(200, resp);
     } finally {
