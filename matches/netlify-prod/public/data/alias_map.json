@@ -1,0 +1,68 @@
+// matches/netlify-prod/functions/_util/canon.js
+// Утиліти для нормалізації команд і побудови pair_key згідно v1.1 архітектури.
+//
+// Правила:
+// - normaliseTeam: lower-case, trim, remove diacritics, collapse spaces, strip punctuation.
+// - canonicalizeTeam: застосувати alias_map.json; якщо немає відповідника — повернути оригінал (зі збереженим регістром).
+// - buildPairKey: order-independent ключ: sort([home_canon, away_canon]).join('|')
+
+const fs = require('fs');
+const path = require('path');
+
+// Lazy-load alias map (щоб не читати файл при кожному виклику, але мати можливість оновити в деплої)
+let _aliasMapCache = null;
+
+function loadAliasMap() {
+  if (_aliasMapCache) return _aliasMapCache;
+  const aliasPath = path.join(process.cwd(), 'data', 'alias_map.json');
+  const raw = fs.readFileSync(aliasPath, 'utf8');
+  const obj = JSON.parse(raw);
+
+  // перевірка: усі ключі мають бути lowercased і без діакритиків/пунктуації
+  _aliasMapCache = obj;
+  return _aliasMapCache;
+}
+
+// Прибрати діакритики: Barça -> Barca; München -> Munchen
+function stripDiacritics(s) {
+  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+// Нормалізація для ключів alias_map: lower, trim, діакритики, пунктуація → пробіли, мультипробіли → один
+function normalizeForAliasKey(team) {
+  if (!team) return '';
+  const lowered = stripDiacritics(String(team).toLowerCase());
+  // Залишимо тільки літери/цифри/пробіли
+  const lettersSpaces = lowered.replace(/[^a-z0-9\s]/g, ' ');
+  const singleSpaced = lettersSpaces.replace(/\s+/g, ' ').trim();
+  return singleSpaced;
+}
+
+// Канонічна назва з урахуванням alias_map; якщо відсутня — повертаємо оригінал як є
+function canonicalizeTeam(team) {
+  const alias = loadAliasMap();
+  const key = normalizeForAliasKey(team);
+  const mapped = alias[key];
+  return mapped || String(team).trim();
+}
+
+// Побудова order-independent ключа пари
+function buildPairKey(homeCanon, awayCanon) {
+  return [homeCanon, awayCanon].sort((a, b) => a.localeCompare(b, 'en')).join('|');
+}
+
+// Комплексна утиліта для матчу
+function canonicalizePair(homeTeam, awayTeam) {
+  const homeCanon = canonicalizeTeam(homeTeam);
+  const awayCanon = canonicalizeTeam(awayTeam);
+  const pairKey = buildPairKey(homeCanon, awayCanon);
+  return { homeCanon, awayCanon, pairKey };
+}
+
+module.exports = {
+  stripDiacritics,
+  normalizeForAliasKey,
+  canonicalizeTeam,
+  buildPairKey,
+  canonicalizePair
+};
