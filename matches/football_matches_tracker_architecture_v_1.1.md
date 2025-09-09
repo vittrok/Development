@@ -409,3 +409,33 @@
 **This document is the source of truth for the agreed architecture.**  
 When implementation deviates, update this doc first, then code.
 
+
+
+
+
+Appendix A — DB schema snapshot (2025-09-10) і сумісність
+
+Аудит схеми (CSV, dev/fixtures/):
+
+db_schema_2025-09-10.columns.csv
+
+db_schema_2025-09-10.constraints.csv
+
+db_schema_2025-09-10.indexes.csv
+
+Узгоджені індекси/ключі, що використовує бекенд згідно v1.1:
+
+Унікальність матчів у межах дня: (date_bucket, pair_key) → індекс ux_matches_datebucket_pairkey (джерело істини для дедуплікації).
+
+Виявлені легасі-елементи (залишаємо, не чіпаємо, не покладаємось у новому коді):
+
+matches: наявні додаткові UQ/IDX (напр. matches_kickoff_at_idx, matches_date_match_key, ux_matches_natural_key (league, kickoff_at, home_team, away_team) тощо).
+Політика: новий код покладається на date_bucket/pair_key + kickoff_at індекси з v1.1; легасі індекси не видаляємо й не використовуємо.
+
+preferences: могла існувати до міграцій без id. Міграція v1.1 оздоровлює таблицю: додає id smallint DEFAULT 1, PK preferences_pkey (якщо його нема) та CHECK (id=1). Якщо є додаткові поля (напр. user_id) чи UQ (preferences_user_id_key) — не змінюємо.
+
+staging_matches: на інстансах може містити додаткові колонки й індекси (напр. date_bucket, pair_key, imported_at, state). Стратегія v1.1: не видаляємо, читаємо тільки поля, визначені контрактом імпорту; решта — ігноруються.
+
+Безпека: жодних хардкодів логін/пароль у коді/скриптах; доступ до БД тільки через env DATABASE_URL.
+
+Процес аудиту при зміні таблиць (Rule 14): оновити q.sql, виконати, покласти свіжі CSV у dev/fixtures/, у коміті зазначити DB schema audit: YYYY-MM-DD.
