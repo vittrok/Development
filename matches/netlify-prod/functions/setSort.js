@@ -1,6 +1,8 @@
+// File: functions/setSort.js
 // POST /.netlify/functions/setSort
 // Архітектура v1.1: cookie-сесія (admin) + CSRF, м'які rate limits, валідація payload
-// РОБАСТНИЙ парсинг тіла: JSON або application/x-www-form-urlencoded (+ base64 підтримка)
+// Робастний парсинг тіла: JSON або application/x-www-form-urlencoded (+ base64 підтримка)
+// Узгоджено з /me та /getPreferences: перевірка Origin, оновлення updated_by
 
 const { Pool } = require("pg");
 const crypto = require("crypto");
@@ -143,7 +145,13 @@ exports.handler = async (event) => {
       return { statusCode: 200, headers: corsHeaders, body: "" };
     }
     if (event.httpMethod !== "POST") {
-      return json(405, { ok: false, error: "Method Not Allowed" });
+      return json(405, { ok: false, error: "method_not_allowed" });
+    }
+
+    // --- Перевірка ORIGIN (узгоджено з /getPreferences) ---
+    const origin = event.headers?.origin || event.headers?.Origin || "";
+    if (origin && origin !== ORIGIN) {
+      return json(403, { ok: false, error: "forbidden_origin" });
     }
 
     // --- Робастний парсинг тіла ---
@@ -156,19 +164,20 @@ exports.handler = async (event) => {
       catch { return json(400, { ok: false, error: "invalid_body_b64" }); }
     }
 
+    // підтримуємо обидва набори ключів: (col,order) і (sort_col,sort_order)
     let sort_col = "";
     let sort_order = "asc";
 
     if (ctype === "application/x-www-form-urlencoded") {
       const form = parseFormURLEncoded(raw);
-      sort_col = normStr(form.col);
-      sort_order = normStr(form.order || "asc").toLowerCase();
+      sort_col = normStr(form.sort_col || form.col);
+      sort_order = normStr(form.sort_order || form.order || "asc").toLowerCase();
     } else {
-      // За замовчанням — JSON (допускаємо application/json і відсутній/дивний Content-Type)
+      // JSON або "дивний" content-type
       try {
         const body = raw ? JSON.parse(raw) : {};
-        sort_col = normStr(body.col);
-        sort_order = normStr(body.order || "asc").toLowerCase();
+        sort_col = normStr(body.sort_col || body.col);
+        sort_order = normStr(body.sort_order || body.order || "asc").toLowerCase();
       } catch {
         return json(400, { ok: false, error: "invalid_json" });
       }
@@ -253,15 +262,16 @@ exports.handler = async (event) => {
         return json(429, { ok: false, error: "rate_limited_global" }, { "Retry-After": String(rlGlob.retryAfter) });
       }
 
-      // Upsert у preferences
+      // Upsert у preferences (+ updated_by)
       await client.query(
         `
-        INSERT INTO preferences(user_id, sort_col, sort_order, updated_at)
-        VALUES ($1, $2, $3, now())
+        INSERT INTO preferences(user_id, sort_col, sort_order, updated_at, updated_by)
+        VALUES ($1, $2, $3, now(), $1)
         ON CONFLICT (user_id)
-        DO UPDATE SET sort_col = EXCLUDED.sort_col,
+        DO UPDATE SET sort_col   = EXCLUDED.sort_col,
                       sort_order = EXCLUDED.sort_order,
-                      updated_at = now()
+                      updated_at = now(),
+                      updated_by = EXCLUDED.updated_by
         `,
         [userId, sort_col, sort_order]
       );
