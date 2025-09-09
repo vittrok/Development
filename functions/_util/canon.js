@@ -1,25 +1,54 @@
-// dev/fixtures/test-canon.js
+// matches/netlify-prod/functions/_util/canon.js
+// Утиліти для нормалізації команд і побудови pair_key згідно v1.1 архітектури.
+
+const fs = require('fs');
 const path = require('path');
-process.chdir(path.join(__dirname, '..', '..')); // -> matches/netlify-prod
 
-const { canonicalizePair } = require(path.join(process.cwd(), 'functions', '_util', 'canon.js'));
-const tests = require(path.join(process.cwd(), 'dev', 'fixtures', 'alias-test.json'));
+let _aliasMapCache = null;
 
-let failed = 0;
-for (const t of tests) {
-  const { homeCanon, awayCanon, pairKey } = canonicalizePair(t.home, t.away);
-  const ok = pairKey === t.expect_pair;
-  if (!ok) {
-    console.error(`FAIL: ${t.home} vs ${t.away} ⇒ ${pairKey} (expected ${t.expect_pair})`);
-    failed++;
-  } else {
-    console.log(`OK  : ${t.home} vs ${t.away} ⇒ ${pairKey}`);
-  }
+function loadAliasMap() {
+  if (_aliasMapCache) return _aliasMapCache;
+  const aliasPath = path.join(process.cwd(), 'data', 'alias_map.json');
+  const raw = fs.readFileSync(aliasPath, 'utf8');
+  const obj = JSON.parse(raw);
+  _aliasMapCache = obj;
+  return _aliasMapCache;
 }
 
-if (failed) {
-  console.error(`\nFAILED: ${failed} case(s)`);
-  process.exit(1);
-} else {
-  console.log(`\nALL OK`);
+function stripDiacritics(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
+
+function normalizeForAliasKey(team) {
+  if (!team) return '';
+  const lowered = stripDiacritics(String(team).toLowerCase());
+  const lettersSpaces = lowered.replace(/[^a-z0-9\s]/g, ' ');
+  const singleSpaced = lettersSpaces.replace(/\s+/g, ' ').trim();
+  return singleSpaced;
+}
+
+function canonicalizeTeam(team) {
+  const alias = loadAliasMap();
+  const key = normalizeForAliasKey(team);
+  const mapped = alias[key];
+  return mapped || String(team).trim();
+}
+
+function buildPairKey(homeCanon, awayCanon) {
+  return [homeCanon, awayCanon].sort((a, b) => a.localeCompare(b, 'en')).join('|');
+}
+
+function canonicalizePair(homeTeam, awayTeam) {
+  const homeCanon = canonicalizeTeam(homeTeam);
+  const awayCanon = canonicalizeTeam(awayTeam);
+  const pairKey = buildPairKey(homeCanon, awayCanon);
+  return { homeCanon, awayCanon, pairKey };
+}
+
+module.exports = {
+  stripDiacritics,
+  normalizeForAliasKey,
+  canonicalizeTeam,
+  buildPairKey,
+  canonicalizePair
+};
