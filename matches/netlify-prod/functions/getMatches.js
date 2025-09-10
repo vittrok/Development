@@ -1,13 +1,9 @@
 // matches/netlify-prod/functions/getMatches.js
-// Мікрокрок 18.4.0.13: додали ДІАГНОСТИЧНЕ логування в Netlify (без зміни бізнес-логіки й прав).
-// -> логуються тільки "ознаки наявності" заголовків/кук (значення НЕ виводимо).
-// -> auth як і раніше робить requireAuth; ми лише допомагаємо з'ясувати причину 401.
+// Мікрокрок 18.4.0.14: лог статусу/тіла, якщо requireAuth ПОВЕРТАЄ 4xx (а не кидає).
 
-// ==== Імпорти ====
 const { requireAuth, corsHeaders } = require('./_utils');
 const { getClient } = require('./_db');
 
-// ==== Бізнес-логіка без змін ====
 async function coreGetMatches() {
   const client = getClient();
   try {
@@ -50,34 +46,20 @@ async function coreGetMatches() {
   }
 }
 
-/**
- * Адаптер, що підтримує обидва варіанти requireAuth:
- * 1) HOF: requireAuth(handler) -> (event, context) => response
- * 2) Виклик із подією: requireAuth(event, context, handler) -> response
- */
+// Підтримуємо обидві сигнатури requireAuth
 function wrapAuth(handler) {
   try {
     const maybe = requireAuth(handler);
-    if (typeof maybe === 'function') {
-      return maybe;
-    }
-    return async (event, context) => {
-      return await requireAuth(event, context, handler);
-    };
-  } catch (_e) {
-    return async (event, context) => {
-      return await requireAuth(event, context, handler);
-    };
+    if (typeof maybe === 'function') return maybe;
+    return async (event, context) => await requireAuth(event, context, handler);
+  } catch {
+    return async (event, context) => await requireAuth(event, context, handler);
   }
 }
 
-const guarded = wrapAuth(async (_event) => {
-  return await coreGetMatches();
-});
+const guarded = wrapAuth(async () => coreGetMatches());
 
-// ==== Діагностика в handler ====
 exports.handler = async function handler(event, context) {
-  // CORS preflight
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers: corsHeaders() };
   }
@@ -85,50 +67,42 @@ exports.handler = async function handler(event, context) {
     return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
   }
 
-  // Безпечне логування присутності хедерів/кук
+  // Діагностика наявності заголовків (значень не світимо)
   try {
     const h = event.headers || {};
-    const hasCookie = typeof h.cookie === 'string' && /session=/.test(h.cookie);
-    const hasCsrfHdr = typeof h['x-csrf'] === 'string' && h['x-csrf'].length > 0;
-    const hasXReq = typeof h['x-requested-with'] === 'string';
-    const hasOrigin = typeof h['origin'] === 'string';
-    const hasReferer = typeof h['referer'] === 'string';
-
-    // НЕ логувати значення, лише наявність
-    console.log(
-      '[getMatches] diag:',
-      JSON.stringify({
-        method: event.httpMethod,
-        hasCookie,
-        hasCsrfHdr,
-        hasXReq,
-        hasOrigin,
-        hasReferer
-      })
-    );
+    const hasCookie   = typeof h.cookie === 'string' && /session=/.test(h.cookie);
+    const hasCsrfHdr  = typeof h['x-csrf'] === 'string' && h['x-csrf'].length > 0;
+    const hasXReq     = typeof h['x-requested-with'] === 'string';
+    const hasOrigin   = typeof h['origin'] === 'string';
+    const hasReferer  = typeof h['referer'] === 'string';
+    console.log('[getMatches] diag:', JSON.stringify({ method: event.httpMethod, hasCookie, hasCsrfHdr, hasXReq, hasOrigin, hasReferer }));
   } catch (e) {
-    console.warn('[getMatches] diag logging failed:', String(e && e.message || e));
+    console.warn('[getMatches] diag logging failed:', String(e?.message || e));
   }
 
   try {
     const res = await guarded(event, context);
-    // Додаємо CORS у відповідь
-    return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
-  } catch (e) {
-    // Якщо requireAuth відхилив (часто кидають 401), спробуємо це віддзеркалити, але не розкривати деталей
-    const msg = String(e && e.message || e);
-    const is401 = /unauthorized|401/i.test(msg);
 
-    if (is401) {
-      console.warn('[getMatches] auth rejected:', msg);
-      return { statusCode: 401, headers: corsHeaders(), body: 'unauthorized' };
+    // 👉 ДОДАНО: якщо requireAuth повернув 4xx — залогуємо код і короткий body
+    if (res && typeof res.statusCode === 'number' && res.statusCode >= 400) {
+      let preview = '';
+      try {
+        const b = typeof res.body === 'string' ? res.body : JSON.stringify(res.body ?? '');
+        preview = b.slice(0, 160);
+      } catch {}
+      console.warn('[getMatches] guarded returned non-2xx:', { statusCode: res.statusCode, bodyPreview: preview });
     }
 
+    return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const is401 = /unauthorized|401/i.test(msg);
+    if (is401) {
+      console.warn('[getMatches] auth rejected (thrown):', msg);
+      return { statusCode: 401, headers: corsHeaders(), body: 'unauthorized' };
+    }
     console.error('[getMatches] error:', msg);
-    return {
-      statusCode: 500,
-      headers: corsHeaders(),
-      body: JSON.stringify({ ok: false, error: msg })
-    };
+    return { statusCode: 500, headers: corsHeaders(), body: JSON.stringify({ ok:false, error: msg }) };
   }
 };
+// Мікрокрок
