@@ -1,10 +1,27 @@
+// matches/netlify-prod/functions/getMatches.js
+// Мікрокрок 18.4.0: додали requireAuth + CORS preflight, формат відповіді не чіпаємо.
+
+const { requireAuth, corsHeaders } = require('./_utils');
 const { getClient } = require('./_db');
 
-exports.handler = async function() {
+exports.handler = async function (event) {
+  // CORS preflight
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 204, headers: corsHeaders() };
+  }
+  if (event.httpMethod !== 'GET') {
+    return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
+  }
+
+  // 1) Вимагаємо активну сесію (401 якщо відсутня/прострочена/відrevoke’на)
+  const auth = await requireAuth(event);
+  if (!auth.session) return auth; // тут уже готова 401-відповідь з CORS
+
   const client = getClient();
   try {
     await client.connect();
-    // read sort
+
+    // --- нижче ТВОЯ поточна логіка getMatches (без змін) ---
     const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
     let sortCol = 'date', sortOrder = 'asc';
     const allowed = ['rank','match','tournament','date','link','seen','comments'];
@@ -33,11 +50,15 @@ exports.handler = async function() {
 
     return {
       statusCode: 200,
-      headers: { 'content-type': 'application/json' },
+      headers: { ...corsHeaders(), 'content-type': 'application/json' },
       body: JSON.stringify({ matches, sort: { column: sortCol, order: sortOrder } })
     };
   } catch (e) {
-    return { statusCode: 500, body: JSON.stringify({ error: String(e) }) };
+    return {
+      statusCode: 500,
+      headers: corsHeaders(),
+      body: JSON.stringify({ error: String(e) })
+    };
   } finally {
     await client.end();
   }
