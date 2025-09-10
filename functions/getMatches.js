@@ -1,16 +1,17 @@
 // matches/netlify-prod/functions/getMatches.js
-// Мікрокрок 18.4.0.7: правильний CommonJS-експорт handler + requireAuth як HOF.
-// Формат відповіді та SQL залишаємо без змін ({"matches":[...], "sort":{...}}).
+// Мікрокрок 18.4.0.7: Гарантуємо, що експортується ФУНКЦІЯ handler.
+// Формат відповіді та SQL НЕ змінюємо. Логіка як у твоєму поточному коді.
 
 const { requireAuth, corsHeaders } = require('./_utils');
 const { getClient } = require('./_db');
 
+// Твоя поточна бізнес-логіка як окрема async-функція
 async function coreGetMatches() {
   const client = getClient();
   try {
     await client.connect();
 
-    // --- ваша поточна логіка getMatches (без змін) ---
+    // --- ПОЧАТОК: існуюча у тебе логіка без змін ---
     const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
 
     let sortCol = 'date', sortOrder = 'asc';
@@ -43,12 +44,20 @@ async function coreGetMatches() {
       headers: { 'content-type': 'application/json; charset=utf-8' },
       body: JSON.stringify({ matches, sort: { column: sortCol, order: sortOrder } })
     };
+    // --- КІНЕЦЬ: існуюча у тебе логіка ---
   } finally {
     await client.end();
   }
 }
 
-module.exports.handler = requireAuth(async (event) => {
+// Створюємо guard-функцію через requireAuth (HOF)
+const guarded = requireAuth(async (event) => {
+  // тут уже буде перевірка сесії всередині requireAuth
+  return await coreGetMatches();
+});
+
+// Експортуємо ЯВНУ функцію handler (це важливо для Netlify)
+exports.handler = async function handler(event, context) {
   // CORS preflight
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers: corsHeaders() };
@@ -58,8 +67,8 @@ module.exports.handler = requireAuth(async (event) => {
   }
 
   try {
-    const res = await coreGetMatches();
-    // гарантуємо CORS у відповіді
+    const res = await guarded(event, context);
+    // додамо CORS до будь-якої відповіді
     return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
   } catch (e) {
     return {
@@ -68,4 +77,5 @@ module.exports.handler = requireAuth(async (event) => {
       body: JSON.stringify({ ok: false, error: String(e?.message || e) })
     };
   }
-});
+};
+// --- КІНЕЦЬ getMatches.js ---
