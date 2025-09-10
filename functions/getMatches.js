@@ -1,7 +1,7 @@
 // matches/netlify-prod/functions/getMatches.js
-// Мікрокрок 18.4.0.15: розширена діагностика (path/rawUrl), бізнес-логіку НЕ змінюємо.
+// Мікрокрок 18.4.0.16: використовуємо _auth_debug (лише діагностика), логіка прав доступу НЕ змінена.
 
-const { requireAuth, corsHeaders } = require('./_utils');
+const { requireAuth, corsHeaders } = require('./_auth_debug'); // <-- тут
 const { getClient } = require('./_db');
 
 async function coreGetMatches() {
@@ -46,7 +46,7 @@ async function coreGetMatches() {
   }
 }
 
-// Підтримка обох сигнатур requireAuth
+// Підтримуємо обидві сигнатури requireAuth
 function wrapAuth(handler) {
   try {
     const maybe = requireAuth(handler);
@@ -67,7 +67,7 @@ exports.handler = async function handler(event, context) {
     return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
   }
 
-  // Діагностика (НЕ світимо значення)
+  // Діагностика (значення не світимо)
   try {
     const h = event.headers || {};
     const hasCookie   = typeof h.cookie === 'string' && /session=/.test(h.cookie);
@@ -75,22 +75,18 @@ exports.handler = async function handler(event, context) {
     const hasXReq     = typeof h['x-requested-with'] === 'string';
     const hasOrigin   = typeof h['origin'] === 'string';
     const hasReferer  = typeof h['referer'] === 'string';
-    console.log(
-      '[getMatches] diag:',
-      JSON.stringify({
-        method: event.httpMethod,
-        path: event.path,
-        rawUrl: event.rawUrl,
-        hasCookie, hasCsrfHdr, hasXReq, hasOrigin, hasReferer
-      })
-    );
+    console.log('[getMatches] diag:', JSON.stringify({
+      method: event.httpMethod,
+      path: event.path,
+      rawUrl: event.rawUrl,
+      hasCookie, hasCsrfHdr, hasXReq, hasOrigin, hasReferer
+    }));
   } catch (e) {
     console.warn('[getMatches] diag logging failed:', String(e?.message || e));
   }
 
   try {
     const res = await guarded(event, context);
-
     if (res && typeof res.statusCode === 'number' && res.statusCode >= 400) {
       let preview = '';
       try {
@@ -99,7 +95,6 @@ exports.handler = async function handler(event, context) {
       } catch {}
       console.warn('[getMatches] guarded returned non-2xx:', { statusCode: res.statusCode, bodyPreview: preview });
     }
-
     return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
   } catch (e) {
     const msg = String(e?.message || e);
@@ -112,4 +107,3 @@ exports.handler = async function handler(event, context) {
     return { statusCode: 500, headers: corsHeaders(), body: JSON.stringify({ ok:false, error: msg }) };
   }
 };
-// Мікрокрок 18.4.0.15: розширена діагностика (path/rawUrl), бізнес-логіку НЕ змінюємо.
