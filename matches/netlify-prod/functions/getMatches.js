@@ -1,17 +1,17 @@
 // matches/netlify-prod/functions/getMatches.js
-// Мікрокрок 18.4.0.7: Гарантуємо, що експортується ФУНКЦІЯ handler.
-// Формат відповіді та SQL НЕ змінюємо. Логіка як у твоєму поточному коді.
+// Мікрокрок 18.4.0.8: адаптер до requireAuth для обох можливих сигнатур.
+// Формат відповіді та SQL НЕ змінюємо.
 
 const { requireAuth, corsHeaders } = require('./_utils');
 const { getClient } = require('./_db');
 
-// Твоя поточна бізнес-логіка як окрема async-функція
+// Твоя існуюча бізнес-логіка як окрема async-функція
 async function coreGetMatches() {
   const client = getClient();
   try {
     await client.connect();
 
-    // --- ПОЧАТОК: існуюча у тебе логіка без змін ---
+    // --- ПОЧАТОК: існуюча логіка без змін ---
     const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
 
     let sortCol = 'date', sortOrder = 'asc';
@@ -44,19 +44,43 @@ async function coreGetMatches() {
       headers: { 'content-type': 'application/json; charset=utf-8' },
       body: JSON.stringify({ matches, sort: { column: sortCol, order: sortOrder } })
     };
-    // --- КІНЕЦЬ: існуюча у тебе логіка ---
+    // --- КІНЕЦЬ: існуюча логіка ---
   } finally {
     await client.end();
   }
 }
 
-// Створюємо guard-функцію через requireAuth (HOF)
-const guarded = requireAuth(async (event) => {
-  // тут уже буде перевірка сесії всередині requireAuth
+/**
+ * Адаптер, що підтримує обидва варіанти реалізації requireAuth:
+ * 1) HOF: requireAuth(handler) -> (event, context) => response
+ * 2) Виклик із подією: requireAuth(event, context, handler) -> response
+ */
+function wrapAuth(handler) {
+  try {
+    const maybe = requireAuth(handler);
+    if (typeof maybe === 'function') {
+      // Варіант HOF — повертаємо обгорнуту функцію
+      return maybe;
+    }
+    // Якщо це не функція — вважаємо, що requireAuth очікує (event, context, handler)
+    return async (event, context) => {
+      return await requireAuth(event, context, handler);
+    };
+  } catch (_e) {
+    // Якщо requireAuth кидає помилку при такому виклику — теж вважаємо сигнатуру (event, context, handler)
+    return async (event, context) => {
+      return await requireAuth(event, context, handler);
+    };
+  }
+}
+
+// Обгортаємо coreGetMatches адаптером авторизації
+const guarded = wrapAuth(async (event) => {
+  // Якщо треба — event можна використовувати для більш тонкого контролю
   return await coreGetMatches();
 });
 
-// Експортуємо ЯВНУ функцію handler (це важливо для Netlify)
+// Експортуємо явний handler для Netlify
 exports.handler = async function handler(event, context) {
   // CORS preflight
   if (event.httpMethod === 'OPTIONS') {
@@ -68,8 +92,12 @@ exports.handler = async function handler(event, context) {
 
   try {
     const res = await guarded(event, context);
-    // додамо CORS до будь-якої відповіді
-    return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
+    // Гарантуємо CORS у відповіді
+    const headers = { ...corsHeaders(), ...(res && res.headers ? res.headers : {}) };
+    // Якщо guarded повернув тільки body/statusCode — зберемо відповідь коректно
+    const statusCode = res && typeof res.statusCode === 'number' ? res.statusCode : 200;
+    const body = res && typeof res.body !== 'undefined' ? res.body : JSON.stringify(res ?? {});
+    return { statusCode, headers, body };
   } catch (e) {
     return {
       statusCode: 500,
