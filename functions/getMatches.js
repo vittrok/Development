@@ -1,24 +1,16 @@
 // matches/netlify-prod/functions/getMatches.js
-// Мікрокрок 18.4.0.7: виправляємо інтеграцію requireAuth як HOF (як у /me).
-// Формат відповіді та SQL ЛИШАЄМО без змін.
+// Мікрокрок 18.4.0.7: правильний CommonJS-експорт handler + requireAuth як HOF.
+// Формат відповіді та SQL залишаємо без змін ({"matches":[...], "sort":{...}}).
 
 const { requireAuth, corsHeaders } = require('./_utils');
 const { getClient } = require('./_db');
 
-exports.handler = requireAuth(async (event) => {
-  // CORS preflight
-  if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: corsHeaders() };
-  }
-  if (event.httpMethod !== 'GET') {
-    return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
-  }
-
+async function coreGetMatches() {
   const client = getClient();
   try {
     await client.connect();
 
-    // --- твоя поточна логіка getMatches (без змін формату/SQL) ---
+    // --- ваша поточна логіка getMatches (без змін) ---
     const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
 
     let sortCol = 'date', sortOrder = 'asc';
@@ -48,16 +40,32 @@ exports.handler = requireAuth(async (event) => {
 
     return {
       statusCode: 200,
-      headers: { ...corsHeaders(), 'content-type': 'application/json; charset=utf-8' },
+      headers: { 'content-type': 'application/json; charset=utf-8' },
       body: JSON.stringify({ matches, sort: { column: sortCol, order: sortOrder } })
     };
+  } finally {
+    await client.end();
+  }
+}
+
+module.exports.handler = requireAuth(async (event) => {
+  // CORS preflight
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 204, headers: corsHeaders() };
+  }
+  if (event.httpMethod !== 'GET') {
+    return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
+  }
+
+  try {
+    const res = await coreGetMatches();
+    // гарантуємо CORS у відповіді
+    return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
   } catch (e) {
     return {
       statusCode: 500,
       headers: corsHeaders(),
       body: JSON.stringify({ ok: false, error: String(e?.message || e) })
     };
-  } finally {
-    await client.end();
   }
 });
