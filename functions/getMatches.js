@@ -1,5 +1,5 @@
 // matches/netlify-prod/functions/getMatches.js
-// Мікрокрок 18.4.0.14: лог статусу/тіла, якщо requireAuth ПОВЕРТАЄ 4xx (а не кидає).
+// Мікрокрок 18.4.0.15: розширена діагностика (path/rawUrl), бізнес-логіку НЕ змінюємо.
 
 const { requireAuth, corsHeaders } = require('./_utils');
 const { getClient } = require('./_db');
@@ -46,7 +46,7 @@ async function coreGetMatches() {
   }
 }
 
-// Підтримуємо обидві сигнатури requireAuth
+// Підтримка обох сигнатур requireAuth
 function wrapAuth(handler) {
   try {
     const maybe = requireAuth(handler);
@@ -67,7 +67,7 @@ exports.handler = async function handler(event, context) {
     return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
   }
 
-  // Діагностика наявності заголовків (значень не світимо)
+  // Діагностика (НЕ світимо значення)
   try {
     const h = event.headers || {};
     const hasCookie   = typeof h.cookie === 'string' && /session=/.test(h.cookie);
@@ -75,7 +75,15 @@ exports.handler = async function handler(event, context) {
     const hasXReq     = typeof h['x-requested-with'] === 'string';
     const hasOrigin   = typeof h['origin'] === 'string';
     const hasReferer  = typeof h['referer'] === 'string';
-    console.log('[getMatches] diag:', JSON.stringify({ method: event.httpMethod, hasCookie, hasCsrfHdr, hasXReq, hasOrigin, hasReferer }));
+    console.log(
+      '[getMatches] diag:',
+      JSON.stringify({
+        method: event.httpMethod,
+        path: event.path,
+        rawUrl: event.rawUrl,
+        hasCookie, hasCsrfHdr, hasXReq, hasOrigin, hasReferer
+      })
+    );
   } catch (e) {
     console.warn('[getMatches] diag logging failed:', String(e?.message || e));
   }
@@ -83,7 +91,6 @@ exports.handler = async function handler(event, context) {
   try {
     const res = await guarded(event, context);
 
-    // 👉 ДОДАНО: якщо requireAuth повернув 4xx — залогуємо код і короткий body
     if (res && typeof res.statusCode === 'number' && res.statusCode >= 400) {
       let preview = '';
       try {
@@ -105,4 +112,4 @@ exports.handler = async function handler(event, context) {
     return { statusCode: 500, headers: corsHeaders(), body: JSON.stringify({ ok:false, error: msg }) };
   }
 };
-// Мікрокрок
+// Мікрокрок 18.4.0.15: розширена діагностика (path/rawUrl), бізнес-логіку НЕ змінюємо.
