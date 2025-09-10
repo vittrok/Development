@@ -1,17 +1,18 @@
 // matches/netlify-prod/functions/getMatches.js
-// Мікрокрок 18.4.0.8: адаптер до requireAuth для обох можливих сигнатур.
-// Формат відповіді та SQL НЕ змінюємо.
+// Мікрокрок 18.4.0.13: додали ДІАГНОСТИЧНЕ логування в Netlify (без зміни бізнес-логіки й прав).
+// -> логуються тільки "ознаки наявності" заголовків/кук (значення НЕ виводимо).
+// -> auth як і раніше робить requireAuth; ми лише допомагаємо з'ясувати причину 401.
 
+// ==== Імпорти ====
 const { requireAuth, corsHeaders } = require('./_utils');
 const { getClient } = require('./_db');
 
-// Твоя існуюча бізнес-логіка як окрема async-функція
+// ==== Бізнес-логіка без змін ====
 async function coreGetMatches() {
   const client = getClient();
   try {
     await client.connect();
 
-    // --- ПОЧАТОК: існуюча логіка без змін ---
     const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
 
     let sortCol = 'date', sortOrder = 'asc';
@@ -44,14 +45,13 @@ async function coreGetMatches() {
       headers: { 'content-type': 'application/json; charset=utf-8' },
       body: JSON.stringify({ matches, sort: { column: sortCol, order: sortOrder } })
     };
-    // --- КІНЕЦЬ: існуюча логіка ---
   } finally {
     await client.end();
   }
 }
 
 /**
- * Адаптер, що підтримує обидва варіанти реалізації requireAuth:
+ * Адаптер, що підтримує обидва варіанти requireAuth:
  * 1) HOF: requireAuth(handler) -> (event, context) => response
  * 2) Виклик із подією: requireAuth(event, context, handler) -> response
  */
@@ -59,28 +59,23 @@ function wrapAuth(handler) {
   try {
     const maybe = requireAuth(handler);
     if (typeof maybe === 'function') {
-      // Варіант HOF — повертаємо обгорнуту функцію
       return maybe;
     }
-    // Якщо це не функція — вважаємо, що requireAuth очікує (event, context, handler)
     return async (event, context) => {
       return await requireAuth(event, context, handler);
     };
   } catch (_e) {
-    // Якщо requireAuth кидає помилку при такому виклику — теж вважаємо сигнатуру (event, context, handler)
     return async (event, context) => {
       return await requireAuth(event, context, handler);
     };
   }
 }
 
-// Обгортаємо coreGetMatches адаптером авторизації
-const guarded = wrapAuth(async (event) => {
-  // Якщо треба — event можна використовувати для більш тонкого контролю
+const guarded = wrapAuth(async (_event) => {
   return await coreGetMatches();
 });
 
-// Експортуємо явний handler для Netlify
+// ==== Діагностика в handler ====
 exports.handler = async function handler(event, context) {
   // CORS preflight
   if (event.httpMethod === 'OPTIONS') {
@@ -90,20 +85,50 @@ exports.handler = async function handler(event, context) {
     return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
   }
 
+  // Безпечне логування присутності хедерів/кук
+  try {
+    const h = event.headers || {};
+    const hasCookie = typeof h.cookie === 'string' && /session=/.test(h.cookie);
+    const hasCsrfHdr = typeof h['x-csrf'] === 'string' && h['x-csrf'].length > 0;
+    const hasXReq = typeof h['x-requested-with'] === 'string';
+    const hasOrigin = typeof h['origin'] === 'string';
+    const hasReferer = typeof h['referer'] === 'string';
+
+    // НЕ логувати значення, лише наявність
+    console.log(
+      '[getMatches] diag:',
+      JSON.stringify({
+        method: event.httpMethod,
+        hasCookie,
+        hasCsrfHdr,
+        hasXReq,
+        hasOrigin,
+        hasReferer
+      })
+    );
+  } catch (e) {
+    console.warn('[getMatches] diag logging failed:', String(e && e.message || e));
+  }
+
   try {
     const res = await guarded(event, context);
-    // Гарантуємо CORS у відповіді
-    const headers = { ...corsHeaders(), ...(res && res.headers ? res.headers : {}) };
-    // Якщо guarded повернув тільки body/statusCode — зберемо відповідь коректно
-    const statusCode = res && typeof res.statusCode === 'number' ? res.statusCode : 200;
-    const body = res && typeof res.body !== 'undefined' ? res.body : JSON.stringify(res ?? {});
-    return { statusCode, headers, body };
+    // Додаємо CORS у відповідь
+    return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
   } catch (e) {
+    // Якщо requireAuth відхилив (часто кидають 401), спробуємо це віддзеркалити, але не розкривати деталей
+    const msg = String(e && e.message || e);
+    const is401 = /unauthorized|401/i.test(msg);
+
+    if (is401) {
+      console.warn('[getMatches] auth rejected:', msg);
+      return { statusCode: 401, headers: corsHeaders(), body: 'unauthorized' };
+    }
+
+    console.error('[getMatches] error:', msg);
     return {
       statusCode: 500,
       headers: corsHeaders(),
-      body: JSON.stringify({ ok: false, error: String(e?.message || e) })
+      body: JSON.stringify({ ok: false, error: msg })
     };
   }
 };
-// --- КІНЕЦЬ getMatches.js ---
