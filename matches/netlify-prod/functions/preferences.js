@@ -107,9 +107,11 @@ exports.handler = requireAuth(async (event) => {
     }
 
     if (event.httpMethod === 'POST') {
-      // CSRF обов'язковий
-      const deny = requireCsrf(event);
-      if (deny) return deny;
+      // CSRF перевірка — як у logout.js
+      const csrfOk = await requireCsrf(event);
+      if (!csrfOk) {
+        return { statusCode: 403, headers: corsHeaders(), body: 'forbidden' };
+      }
 
       const incoming = getJsonBody(event);
       if (!incoming || typeof incoming !== 'object') {
