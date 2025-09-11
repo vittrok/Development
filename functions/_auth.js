@@ -4,7 +4,8 @@
 const { corsHeaders, parseCookies } = require('./_utils');
 const { getSession } = require('./_session');
 
-/** Додаємо 'Cookie' до Allow-Headers (як у /me) */
+const DEBUG = process.env.DEBUG_AUTH === 'true';
+
 function corsWithCookie() {
   const h = corsHeaders();
   const key = Object.keys(h).find(k => k.toLowerCase() === 'access-control-allow-headers') || 'Access-Control-Allow-Headers';
@@ -14,43 +15,55 @@ function corsWithCookie() {
   return h;
 }
 
-/** Формуємо суцільний cookie-рядок з усіх можливих джерел події Netlify */
+function mask(val) {
+  if (!val) return '';
+  const s = String(val);
+  if (s.length <= 12) return s[0] + '…' + s[s.length - 1];
+  return s.slice(0, 8) + '…' + s.slice(-8);
+}
+
+/** Суцільний cookie-рядок з усіх можливих джерел Netlify */
 function getCookieHeader(event) {
   if (!event) return '';
-
   const h  = event.headers || {};
   const mv = event.multiValueHeaders || {};
+
   const single = h.cookie || h.Cookie || '';
-
-  let multi = '';
   const mvList = mv.cookie || mv.Cookie;
-  if (Array.isArray(mvList) && mvList.length > 0) {
-    multi = mvList.join('; ');
+  const multi  = Array.isArray(mvList) && mvList.length > 0 ? mvList.join('; ') : '';
+  const arr    = Array.isArray(event.cookies) && event.cookies.length > 0 ? event.cookies.join('; ') : '';
+
+  const combined = [single, multi, arr].filter(Boolean).join('; ');
+
+  if (DEBUG) {
+    console.log('[auth] httpMethod=', event.httpMethod, 'path=', event.path || event.rawUrl || '');
+    console.log('[auth] headers.cookie.len=', single ? single.length : 0);
+    console.log('[auth] mv.cookie.count=', Array.isArray(mvList) ? mvList.length : 0);
+    console.log('[auth] event.cookies.count=', Array.isArray(event.cookies) ? event.cookies.length : 0);
+    console.log('[auth] combinedCookie.len=', combined.length);
+    // УВАГА: самі значення не логимо повністю
+    const sessFromSingle = (single.match(/(?:^|;\s*)session=([^;]+)/i) || [,''])[1];
+    const sessFromMulti  = (multi.match(/(?:^|;\s*)session=([^;]+)/i)  || [,''])[1];
+    const sessFromArr    = (arr.match(/(?:^|;\s*)session=([^;]+)/i)    || [,''])[1];
+    console.log('[auth] session.single=', mask(sessFromSingle));
+    console.log('[auth] session.multi =', mask(sessFromMulti));
+    console.log('[auth] session.arr   =', mask(sessFromArr));
   }
 
-  // Netlify іноді надає cookies як масив (event.cookies)
-  let arr = '';
-  if (Array.isArray(event.cookies) && event.cookies.length > 0) {
-    arr = event.cookies.join('; ');
-  }
-
-  // Склеюємо джерела з роздільниками
-  return [single, multi, arr].filter(Boolean).join('; ');
+  return combined;
 }
 
 /** Витягуємо значення session з cookie-рядка */
 function extractSessionCookie(cookieHeader) {
   if (!cookieHeader) return null;
 
-  // 1) Спроба через існуючий парсер
   try {
     const m = parseCookies(cookieHeader);
     if (m && typeof m.session === 'string' && m.session.length > 0) {
       return m.session;
     }
-  } catch (_) { /* fallback нижче */ }
+  } catch (_) {}
 
-  // 2) Regex-фолбек (допускає відсутність пробілу після ';')
   const re = /(?:^|;\s*)session=([^;]+)/i;
   const match = re.exec(cookieHeader);
   return match ? match[1] : null;
@@ -59,23 +72,30 @@ function extractSessionCookie(cookieHeader) {
 /** requireAuth(handler) */
 function requireAuth(handler) {
   return async (event, context) => {
-    // CORS preflight
     if (event && event.httpMethod === 'OPTIONS') {
       return { statusCode: 204, headers: corsWithCookie() };
     }
 
     const cookieHeader = getCookieHeader(event);
     const sessionCookie = extractSessionCookie(cookieHeader);
+
+    if (DEBUG) {
+      console.log('[auth] extracted.session =', mask(sessionCookie));
+    }
+
     const sess = sessionCookie ? await getSession(sessionCookie) : null;
 
     if (!sess) {
+      if (DEBUG) console.log('[auth] getSession: NOT FOUND');
       return { statusCode: 401, headers: corsWithCookie(), body: 'unauthorized' };
+    }
+
+    if (DEBUG) {
+      console.log('[auth] getSession: OK user_id=', sess.user_id, 'role=', sess.role);
     }
 
     event.auth = { userId: sess.user_id, role: sess.role };
     const res = await handler(event, context);
-
-    // гарантуємо CORS і в успішній відповіді
     return { ...res, headers: { ...(res?.headers || {}), ...corsWithCookie() } };
   };
 }
