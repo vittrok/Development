@@ -1,22 +1,17 @@
-// matches/netlify-prod/functions/getMatches.js
-// Мікрокрок 18.4.0.17: переводимо на HOF requireAuth з _auth.js.
-// Бізнес-логіка та SQL — БЕЗ змін.
-
 const { requireAuth } = require('./_auth');
 const { corsHeaders } = require('./_utils');
 const { getClient } = require('./_db');
 
-// Окрема бізнес-функція без авторизаційної логіки
 async function coreGetMatches() {
   const client = getClient();
   try {
     await client.connect();
 
-    // --- ПОЧАТОК: існуюча логіка без змін ---
+    // існуюча логіка без змін
     const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
 
     let sortCol = 'date', sortOrder = 'asc';
-    const allowed = ['rank','match','tournament','date','link','seen','comments'];
+    const allowed = ['rank','match','tournament','date','link','seen','comments','kickoff_at'];
     if (p.rowCount) {
       const col = p.rows[0].sort_col;
       const ord = p.rows[0].sort_order;
@@ -45,15 +40,15 @@ async function coreGetMatches() {
       headers: { 'content-type': 'application/json; charset=utf-8' },
       body: JSON.stringify({ matches, sort: { column: sortCol, order: sortOrder } })
     };
-    // --- КІНЕЦЬ: існуюча логіка ---
   } finally {
     await client.end();
   }
 }
 
-// Netlify: exports.handler = function
 exports.handler = async function handler(event, context) {
-  // CORS preflight
+  // БЕЗУМОВНА ДІАГНОСТИКА (getMatches)
+  console.log('[gm] entry method=%s', event?.httpMethod);
+
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers: corsHeaders() };
   }
@@ -62,18 +57,15 @@ exports.handler = async function handler(event, context) {
   }
 
   try {
-    // HOF: спочатку загортаємо бізнес-обробник під requireAuth,
-    // потім викликаємо загорнутий.
-    const authed = requireAuth(async (ev) => {
-      // усередині — лише бізнес-логіка
+    const authed = requireAuth(async () => {
+      console.log('[gm] business start');
       return await coreGetMatches();
     });
 
     const res = await authed(event, context);
-
-    // додаємо CORS до відповіді
     return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
   } catch (e) {
+    console.log('[gm] error=%s', e && e.message ? e.message : String(e));
     return {
       statusCode: 500,
       headers: corsHeaders(),
