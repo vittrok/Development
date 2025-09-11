@@ -6,14 +6,32 @@ const { corsHeaders, parseCookies } = require('./_utils');
 const { getSession } = require('./_session');
 
 /**
- * Надійно витягує cookie заголовок та значення "session"
+ * Формує єдиний рядок cookie із headers + multiValueHeaders
  */
-function getCookieHeader(headers) {
-  if (!headers) return '';
-  // Netlify зазвичай дає все нижнім регістром, але про всяк:
-  return headers.cookie || headers.Cookie || '';
+function getCookieHeader(event) {
+  if (!event) return '';
+
+  const h = event.headers || {};
+  const mv = event.multiValueHeaders || {};
+
+  // Стандартний шлях
+  const single = h.cookie || h.Cookie || '';
+
+  // Якщо є мульти-значення — склеюємо
+  let multi = '';
+  const mvList = mv.cookie || mv.Cookie;
+  if (Array.isArray(mvList) && mvList.length > 0) {
+    // Склеюємо через "; " щоб не зламати парсер
+    multi = mvList.join('; ');
+  }
+
+  if (single && multi) return `${single}; ${multi}`;
+  return single || multi || '';
 }
 
+/**
+ * Витягує значення session з рядка Cookie
+ */
 function extractSessionCookie(cookieHeader) {
   if (!cookieHeader) return null;
 
@@ -24,10 +42,10 @@ function extractSessionCookie(cookieHeader) {
       return m.session;
     }
   } catch (_) {
-    // ігноруємо — підстрахуємось regex-добуванням нижче
+    // fallback нижче
   }
 
-  // 2) Надійний regex-фолбек (допускає відсутність пробілу після ';')
+  // 2) Regex-фолбек (допускає відсутність пробілу після ';')
   const re = /(?:^|;\s*)session=([^;]+)/i;
   const match = re.exec(cookieHeader);
   return match ? match[1] : null;
@@ -35,17 +53,15 @@ function extractSessionCookie(cookieHeader) {
 
 /**
  * requireAuth(handler)
- *  - якщо немає валідної сесії -> 401
- *  - якщо є -> додаємо event.auth = { userId, role } і викликаємо handler(event, context)
  */
 function requireAuth(handler) {
   return async (event, context) => {
-    // CORS preflight тут же, щоб HOF був самодостатнім
+    // CORS preflight
     if (event && event.httpMethod === 'OPTIONS') {
       return { statusCode: 204, headers: corsHeaders() };
     }
 
-    const cookieHeader = getCookieHeader(event?.headers);
+    const cookieHeader = getCookieHeader(event);
     const sessionCookie = extractSessionCookie(cookieHeader);
 
     const sess = sessionCookie ? await getSession(sessionCookie) : null;
@@ -54,7 +70,6 @@ function requireAuth(handler) {
       return { statusCode: 401, headers: corsHeaders(), body: 'unauthorized' };
     }
 
-    // збагачуємо подію корисним контекстом
     event.auth = { userId: sess.user_id, role: sess.role };
     return handler(event, context);
   };
