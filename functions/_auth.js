@@ -1,3 +1,6 @@
+// HOF: requireAuth(handler) -> (event, context) => response
+// Узгоджено з архітектурою v1.1. Логи тільки під DEBUG_AUTH=true.
+
 const { corsHeaders, parseCookies } = require('./_utils');
 const { getSession } = require('./_session');
 
@@ -27,7 +30,6 @@ function getCookieHeader(event) {
   const mvList = mv.cookie || mv.Cookie;
   const multi  = Array.isArray(mvList) && mvList.length > 0 ? mvList.join('; ') : '';
   const arr    = Array.isArray(event.cookies) && event.cookies.length > 0 ? event.cookies.join('; ') : '';
-
   const combined = [single, multi, arr].filter(Boolean).join('; ');
 
   if (DEBUG) {
@@ -44,7 +46,6 @@ function getCookieHeader(event) {
       mask(sessFromSingle), mask(sessFromMulti), mask(sessFromArr)
     );
   }
-
   return combined;
 }
 
@@ -67,7 +68,7 @@ function requireAuth(handler) {
 
     if (DEBUG) console.log('[auth] start method=%s path=%s', event?.httpMethod, event?.path || event?.rawUrl || '');
 
-    const cookieHeader = getCookieHeader(event);
+    const cookieHeader  = getCookieHeader(event);
     const sessionCookie = extractSessionCookie(cookieHeader);
 
     if (DEBUG) console.log('[auth] extracted.session=%s', mask(sessionCookie));
@@ -89,4 +90,3 @@ function requireAuth(handler) {
 }
 
 module.exports = { requireAuth };
-// --- КІНЕЦЬ ФАЙЛУ ---

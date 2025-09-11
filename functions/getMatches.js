@@ -1,3 +1,6 @@
+// Повертає список матчів. Авторизація через HOF у _auth.js.
+// Без зайвих логів — відповідає вимогам архітектури.
+
 const { requireAuth } = require('./_auth');
 const { corsHeaders } = require('./_utils');
 const { getClient } = require('./_db');
@@ -56,7 +59,6 @@ exports.handler = async function handler(event, context) {
     const authed = requireAuth(async () => {
       return await coreGetMatches();
     });
-
     const res = await authed(event, context);
     return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
   } catch (e) {
