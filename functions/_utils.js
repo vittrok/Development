@@ -283,3 +283,19 @@ module.exports = {
   // bcrypt для login.js
   bcrypt
 };
+
+
+// ---------------------------
+// AUTH: de-duplication proxy
+// ---------------------------
+// Єдина реалізація HOF requireAuth тепер живе в ./_auth.js.
+// Будь-які імпорти requireAuth з _utils залишаються працездатними.
+try {
+  const { requireAuth } = require('./_auth');
+  module.exports.requireAuth = requireAuth;
+} catch (e) {
+  // Якщо з якоїсь причини _auth недоступний — не валимо увесь utils.
+  // Але в проді _auth має бути присутній.
+  console.error('[utils] requireAuth proxy error:', e && e.message ? e.message : e);
+}
+// ---------------------------
