@@ -1,8 +1,9 @@
 // matches/netlify-prod/functions/getMatches.js
-// Мікрокрок 18.4.0.17: викликаємо requireAuth у стилі (event, context, handler),
-// як у /me. Бізнес-логіку та SQL НЕ змінюємо.
+// Мікрокрок 18.4.0.17: переводимо на HOF requireAuth з _auth.js.
+// Бізнес-логіка та SQL — БЕЗ змін.
 
-const { requireAuth, corsHeaders } = require('./_utils');
+const { requireAuth } = require('./_auth');
+const { corsHeaders } = require('./_utils');
 const { getClient } = require('./_db');
 
 // Окрема бізнес-функція без авторизаційної логіки
@@ -50,22 +51,25 @@ async function coreGetMatches() {
   }
 }
 
-// Експортуємо явну handler-функцію (Netlify вимагає exports.handler = function)
+// Netlify: exports.handler = function
 exports.handler = async function handler(event, context) {
   // CORS preflight
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers: corsHeaders() };
   }
   if (event.httpMethod !== 'GET') {
-    return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
+    return { statusCode: 405, headers: corsHeaders(), body: 'method not allowed' };
   }
 
-  // Викликаємо requireAuth у ТРЬОХАРГУМЕНТНІЙ формі (як у /me)
   try {
-    const res = await requireAuth(event, context, async () => {
-      // всередині — лише бізнес-логіка
+    // HOF: спочатку загортаємо бізнес-обробник під requireAuth,
+    // потім викликаємо загорнутий.
+    const authed = requireAuth(async (ev) => {
+      // усередині — лише бізнес-логіка
       return await coreGetMatches();
     });
+
+    const res = await authed(event, context);
 
     // додаємо CORS до відповіді
     return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
@@ -77,3 +81,4 @@ exports.handler = async function handler(event, context) {
     };
   }
 };
+// --- КІНЕЦЬ ФАЙЛУ ---
