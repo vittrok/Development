@@ -7,7 +7,6 @@ async function coreGetMatches() {
   try {
     await client.connect();
 
-    // існуюча логіка без змін
     const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
 
     let sortCol = 'date', sortOrder = 'asc';
@@ -46,9 +45,6 @@ async function coreGetMatches() {
 }
 
 exports.handler = async function handler(event, context) {
-  // БЕЗУМОВНА ДІАГНОСТИКА (getMatches)
-  console.log('[gm] entry method=%s', event?.httpMethod);
-
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers: corsHeaders() };
   }
@@ -58,14 +54,12 @@ exports.handler = async function handler(event, context) {
 
   try {
     const authed = requireAuth(async () => {
-      console.log('[gm] business start');
       return await coreGetMatches();
     });
 
     const res = await authed(event, context);
     return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
   } catch (e) {
-    console.log('[gm] error=%s', e && e.message ? e.message : String(e));
     return {
       statusCode: 500,
       headers: corsHeaders(),
@@ -73,4 +67,3 @@ exports.handler = async function handler(event, context) {
     };
   }
 };
-// --- КІНЕЦЬ ФАЙЛУ ---

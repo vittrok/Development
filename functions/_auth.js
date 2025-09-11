@@ -1,6 +1,14 @@
-// matches/netlify-prod/functions/_auth.js
 const { corsHeaders, parseCookies } = require('./_utils');
 const { getSession } = require('./_session');
+
+const DEBUG = process.env.DEBUG_AUTH === 'true';
+
+function mask(val) {
+  if (!val) return '';
+  const s = String(val);
+  if (s.length <= 12) return s[0] + '…' + s[s.length - 1];
+  return s.slice(0, 8) + '…' + s.slice(-8);
+}
 
 function corsWithCookie() {
   const h = corsHeaders();
@@ -19,7 +27,25 @@ function getCookieHeader(event) {
   const mvList = mv.cookie || mv.Cookie;
   const multi  = Array.isArray(mvList) && mvList.length > 0 ? mvList.join('; ') : '';
   const arr    = Array.isArray(event.cookies) && event.cookies.length > 0 ? event.cookies.join('; ') : '';
-  return [single, multi, arr].filter(Boolean).join('; ');
+
+  const combined = [single, multi, arr].filter(Boolean).join('; ');
+
+  if (DEBUG) {
+    const sessFromSingle = (single.match(/(?:^|;\s*)session=([^;]+)/i) || [,''])[1];
+    const sessFromMulti  = (multi.match(/(?:^|;\s*)session=([^;]+)/i)  || [,''])[1];
+    const sessFromArr    = (arr.match(/(?:^|;\s*)session=([^;]+)/i)    || [,''])[1];
+    console.log('[auth] cookies: single.len=%d multi.count=%d arr.count=%d combined.len=%d',
+      single ? single.length : 0,
+      Array.isArray(mvList) ? mvList.length : 0,
+      Array.isArray(event.cookies) ? event.cookies.length : 0,
+      combined.length
+    );
+    console.log('[auth] session.from.single=%s multi=%s arr=%s',
+      mask(sessFromSingle), mask(sessFromMulti), mask(sessFromArr)
+    );
+  }
+
+  return combined;
 }
 
 function extractSessionCookie(cookieHeader) {
@@ -39,15 +65,23 @@ function requireAuth(handler) {
       return { statusCode: 204, headers: corsWithCookie() };
     }
 
+    if (DEBUG) console.log('[auth] start method=%s path=%s', event?.httpMethod, event?.path || event?.rawUrl || '');
+
     const cookieHeader = getCookieHeader(event);
     const sessionCookie = extractSessionCookie(cookieHeader);
+
+    if (DEBUG) console.log('[auth] extracted.session=%s', mask(sessionCookie));
+
     const sess = sessionCookie ? await getSession(sessionCookie) : null;
 
     if (!sess) {
+      if (DEBUG) console.log('[auth] getSession: NOT FOUND');
       return { statusCode: 401, headers: corsWithCookie(), body: 'unauthorized' };
     }
 
-    // _session.getSession() повертає { sid, role }
+    if (DEBUG) console.log('[auth] getSession: OK role=%s sid=%s', sess.role, mask(sess.sid));
+
+    // getSession() повертає { sid, role }
     event.auth = { sid: sess.sid, role: sess.role };
     const res = await handler(event, context);
     return { ...res, headers: { ...(res?.headers || {}), ...corsWithCookie() } };
