@@ -14,52 +14,78 @@ function extractSigned(input) {
   if (typeof input === 'string') return input;
   if (input && input.headers) {
     const cookie = input.headers.cookie || input.headers.Cookie || '';
-    const m = /(?:^|;\s*)session=([^;]+)/i.exec(cookie);
-    return m ? decodeURIComponent(m[1]) : null;
+    if (cookie) {
+      // простий парсер cookie
+      const map = {};
+      for (const part of String(cookie).split(/;\s*/)) {
+        const i = part.indexOf('=');
+        if (i > 0) map[part.slice(0, i)] = part.slice(i + 1);
+      }
+      if (map[COOKIE_NAME]) return map[COOKIE_NAME];
+    }
   }
   return null;
 }
 
 /**
- * HMAC-підпис sid: base64url(HMAC-SHA256(SESSION_SECRET, sid))
+ * HMAC-підпис sid у форматі HEX (узгоджено з login та /me)
  */
-function signSid(sid, secret = process.env.SESSION_SECRET || 'dev-secret') {
-  return crypto
-    .createHmac('sha256', String(secret))
-    .update(String(sid))
-    .digest('base64url');
+function signSidHex(sid, secret = process.env.SESSION_SECRET || 'dev-secret') {
+  return crypto.createHmac('sha256', String(secret)).update(String(sid)).digest('hex');
 }
 
 /**
- * Перевіряє підпис "sid.sig", повертає валідний sid або null
+ * Історично тут був base64url — лишимо для сумісності.
+ */
+function signSidB64Url(sid, secret = process.env.SESSION_SECRET || 'dev-secret') {
+  return crypto.createHmac('sha256', String(secret)).update(String(sid)).digest('base64url');
+}
+
+/**
+ * Перевіряє підпис "sid.sig", приймає як HEX, так і base64url. Повертає валідний sid або null.
  */
 function verifySigned(signed, secret = process.env.SESSION_SECRET || 'dev-secret') {
   if (!signed || typeof signed !== 'string') return null;
   const dot = signed.lastIndexOf('.');
   if (dot <= 0) return null;
+
   const sid = signed.slice(0, dot);
   const sig = signed.slice(dot + 1);
   if (!sid || !sig) return null;
-  const good = signSid(sid, secret);
+
+  // готуємо обидва варіанти правильного підпису
+  const goodHex = signSidHex(sid, secret);
+  const goodB64 = signSidB64Url(sid, secret);
+
   try {
-    const a = Buffer.from(sig, 'utf8');
-    const b = Buffer.from(good, 'utf8');
-    if (a.length !== b.length) return null;
-    if (!crypto.timingSafeEqual(a, b)) return null;
+    const a = Buffer.from(String(sig), 'utf8');
+    // Перевіряємо HEX
+    const bHex = Buffer.from(String(goodHex), 'utf8');
+    if (a.length === bHex.length && crypto.timingSafeEqual(a, bHex)) return sid;
+
+    // Перевіряємо base64url
+    const bB64 = Buffer.from(String(goodB64), 'utf8');
+    if (a.length === bB64.length && crypto.timingSafeEqual(a, bB64)) return sid;
   } catch {
     return null;
   }
-  return sid;
+
+  return null;
 }
 
 /**
- * getSession(input)
- * input: рядок "sid.sig" або Netlify event (headers.cookie)
- * Повертає { role, sid } або null (некоректний підпис/не знайдено/прострочено/відкликано)
+ * getSession(signed)
+ *  - приймає "sid.sig", перевіряє підпис; якщо ок — шукає активну сесію в БД
+ *  - повертає { sid, role } або null
  */
-async function getSession(input) {
-  const signed = extractSigned(input);
+async function getSession(signed) {
   if (!signed) return null;
+
+  // дозволяємо також подавати event; виймемо звідти
+  if (typeof signed !== 'string') {
+    const ex = extractSigned(signed);
+    if (ex) signed = ex;
+  }
 
   const sid = verifySigned(String(signed));
   if (!sid) return null;
@@ -85,48 +111,42 @@ async function getSession(input) {
 
 /**
  * createSession(userIdOrObj, role?, ttlSeconds?)
- * Сигнатури:
- *  - createSession(userId, role?, ttlSeconds?)
- *  - createSession({ userId, role?, ttlSeconds? })
  * Повертає { sid, role, expiresAt }.
- * Примітка: цей метод лише створює запис у БД; видача cookie виконується у відповідному ендпоїнті (login).
  */
-async function createSession(userIdOrObj, maybeRole, maybeTtlSeconds) {
-  let userId, role = 'user', ttlSeconds = 60 * 60 * 24 * 30; // 30 днів за замовчуванням
-
+async function createSession(userIdOrObj, role, ttlSeconds) {
+  let userId, r = role, ttl = ttlSeconds;
   if (typeof userIdOrObj === 'object' && userIdOrObj) {
     userId = userIdOrObj.userId;
-    if (userIdOrObj.role) role = userIdOrObj.role;
-    if (userIdOrObj.ttlSeconds) ttlSeconds = userIdOrObj.ttlSeconds;
+    r     = userIdOrObj.role ?? r;
+    ttl   = userIdOrObj.ttlSeconds ?? ttl;
   } else {
     userId = userIdOrObj;
-    if (maybeRole) role = maybeRole;
-    if (maybeTtlSeconds) ttlSeconds = maybeTtlSeconds;
   }
+  if (!userId) throw new Error('createSession: userId required');
 
-  if (!userId) throw new Error('createSession: userId is required');
+  const s = String(Math.random()).slice(2) + '-' + Date.now();
+  const expiresAt = new Date(Date.now() + (Number(ttl) > 0 ? Number(ttl) : 30*24*60*60) * 1000);
 
-  const sid = crypto.randomBytes(16).toString('hex');
-  const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
-
-  const insert = `
-    INSERT INTO sessions (sid, user_id, revoked, expires_at)
-    VALUES ($1, $2, false, $3)
-  `;
   try {
-    await pool.query(insert, [sid, userId, expiresAt.toISOString()]);
+    await pool.query(
+      `INSERT INTO sessions (sid, user_id, role, expires_at, revoked, created_at)
+       VALUES ($1, $2, $3, $4, false, NOW())`,
+      [s, userId, r || 'user', expiresAt]
+    );
   } catch (e) {
     console.error('[createSession] db error:', e);
     throw e;
   }
 
-  return { sid, role, expiresAt: expiresAt.toISOString() };
+  return { sid: s, role: r || 'user', expiresAt: expiresAt.toISOString() };
 }
 
 module.exports = {
   getSession,
   createSession,
-  signSid,
+  // Експортуємо обидва для потенційних тестів/міграцій
+  signSidHex,
+  signSidB64Url,
   verifySigned,
   extractSigned,
   COOKIE_NAME,
