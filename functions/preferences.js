@@ -1,6 +1,7 @@
 // functions/preferences.js
 /* eslint-disable */
-const { corsHeaders, getPool, requireAuth, requireCsrf } = require('./_utils');
+const { requireAuth } = require('./_auth');
+const { corsHeaders, getPool, requireCsrf } = require('./_utils');
 
 const pool = getPool();
 
@@ -47,6 +48,10 @@ function coerceJsonish(obj) {
   return out;
 }
 
+function decodeURIComponentSafe(s) {
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+
 function getJsonBody(event) {
   const raw = decodeMaybeBase64(event).trim();
   const ct = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
@@ -59,27 +64,34 @@ function getJsonBody(event) {
   // чистий JSON (спроба напряму, а потім на випадок percent-encoding)
   return tryParseJSON(raw) || tryParseJSON(decodeURIComponentSafe(raw));
 }
-
-function decodeURIComponentSafe(s) {
-  try { return decodeURIComponent(s); } catch { return s; }
-}
 /* --------------------------------------------------------------------------- */
 
-exports.handler = async (event) => {
+exports.handler = requireAuth(async (event) => {
   // CORS preflight
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers: corsHeaders() };
   }
 
-  // лише для автентифікованих
-  const auth = await requireAuth(event);
-  if (!auth.session) return auth;
-  const userId = auth.session.user_id;
-
   try {
+    // auth-навантаження від HOF: event.auth = { sid, role }
+    // Поточного user_id витягуємо за sid через sessions
+    const { rows: who } = await pool.query(
+      `SELECT s.user_id
+         FROM sessions s
+        WHERE s.sid = $1
+          AND s.revoked = false
+          AND s.expires_at > NOW()
+        LIMIT 1`,
+      [event.auth.sid]
+    );
+    if (!who.length) {
+      return { statusCode: 401, headers: corsHeaders(), body: 'unauthorized' };
+    }
+    const userId = who[0].user_id;
+
     if (event.httpMethod === 'GET') {
       const { rows } = await pool.query(
-        `SELECT COALESCE(data, '{}'::jsonb) AS data
+        `SELECT data
            FROM user_preferences
           WHERE user_id = $1
           LIMIT 1`,
@@ -104,7 +116,7 @@ exports.handler = async (event) => {
         return { statusCode: 400, headers: corsHeaders(), body: 'Invalid JSON body' };
       }
 
-      // shallow merge з існуючим data
+      // shallow merge з існуючим data (jsonb ||)
       const { rows } = await pool.query(
         `INSERT INTO user_preferences (user_id, data, updated_at)
               VALUES ($1, $2::jsonb, NOW())
@@ -124,7 +136,8 @@ exports.handler = async (event) => {
 
     return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
   } catch (e) {
+    // архітектурно — не світимо деталі у відповідь
     console.error('[/preferences] error:', e);
     return { statusCode: 500, headers: corsHeaders(), body: 'preferences failed' };
   }
-};
+});
