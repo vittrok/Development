@@ -1,6 +1,6 @@
 // functions/logout.js
 // Перекладено на HOF requireAuth з ./_auth (18.4.0.18c).
-// CSRF і CORS залишаються як уніфіковані утиліти з _utils.
+// CSRF і CORS — з _utils. Підправлено SQL під фактичну схему (без revoked_at).
 
 const { requireAuth } = require('./_auth');
 const { corsHeaders, requireCsrf, getPool } = require('./_utils');
@@ -16,7 +16,7 @@ async function doLogout(event) {
     return { statusCode: 405, headers: corsHeaders(), body: 'method not allowed' };
   }
 
-  // CSRF перевірка (кине 403 при невдалому сценарії усередині)
+  // CSRF перевірка
   const csrfOk = await requireCsrf(event);
   if (!csrfOk) {
     return { statusCode: 403, headers: corsHeaders(), body: 'forbidden' };
@@ -29,10 +29,12 @@ async function doLogout(event) {
   }
 
   try {
-    // Відкликати сесію
+    // Відкликати сесію — тільки revoked=true (у схемі немає revoked_at)
     await pool.query(
-      `UPDATE sessions SET revoked = true, revoked_at = NOW()
-       WHERE sid = $1 AND revoked = false`,
+      `UPDATE sessions
+         SET revoked = true
+       WHERE sid = $1
+         AND revoked = false`,
       [sid]
     );
 
