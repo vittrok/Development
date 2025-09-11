@@ -6,6 +6,34 @@ const { corsHeaders, parseCookies } = require('./_utils');
 const { getSession } = require('./_session');
 
 /**
+ * Надійно витягує cookie заголовок та значення "session"
+ */
+function getCookieHeader(headers) {
+  if (!headers) return '';
+  // Netlify зазвичай дає все нижнім регістром, але про всяк:
+  return headers.cookie || headers.Cookie || '';
+}
+
+function extractSessionCookie(cookieHeader) {
+  if (!cookieHeader) return null;
+
+  // 1) Спроба через існуючий парсер
+  try {
+    const m = parseCookies(cookieHeader);
+    if (m && typeof m.session === 'string' && m.session.length > 0) {
+      return m.session;
+    }
+  } catch (_) {
+    // ігноруємо — підстрахуємось regex-добуванням нижче
+  }
+
+  // 2) Надійний regex-фолбек (допускає відсутність пробілу після ';')
+  const re = /(?:^|;\s*)session=([^;]+)/i;
+  const match = re.exec(cookieHeader);
+  return match ? match[1] : null;
+}
+
+/**
  * requireAuth(handler)
  *  - якщо немає валідної сесії -> 401
  *  - якщо є -> додаємо event.auth = { userId, role } і викликаємо handler(event, context)
@@ -17,9 +45,10 @@ function requireAuth(handler) {
       return { statusCode: 204, headers: corsHeaders() };
     }
 
-    const cookies = parseCookies(event?.headers?.cookie || event?.headers?.Cookie || '');
-    const signed = cookies['session'];
-    const sess = signed ? await getSession(signed) : null;
+    const cookieHeader = getCookieHeader(event?.headers);
+    const sessionCookie = extractSessionCookie(cookieHeader);
+
+    const sess = sessionCookie ? await getSession(sessionCookie) : null;
 
     if (!sess) {
       return { statusCode: 401, headers: corsHeaders(), body: 'unauthorized' };
@@ -32,3 +61,4 @@ function requireAuth(handler) {
 }
 
 module.exports = { requireAuth };
+// --- КІНЕЦЬ ФАЙЛУ ---
