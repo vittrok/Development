@@ -1,19 +1,18 @@
-// apply-sort.js
-// Накладний скрипт: читає preferences з /me і пересортовує #matches tbody
-// Не містить жодних секретів. Працює після того, як основний бандл відмалював таблицю.
+// File: public/apply-sort.js
+// Накладний скрипт: читає preferences з єдиного ендпойнта /.netlify/functions/preferences
+// і пересортовує #matches tbody. Без секретів. Працює після того, як основний бандл відмалював таблицю.
 
 (function () {
   const ORIGIN = 'https://football-m.netlify.app'; // прод-домен
   const TABLE_SELECTOR = '#matches tbody';
 
   // Відповідність backend-ключів до data-col у <th>
-  // Якщо у вашому thead data-col інші — додайте сюди.
   const COL_MAP = {
-    kickoff_at: ['kickoff_at', 'date', 'kickoff'], // пробуємо по черзі
+    kickoff_at: ['kickoff_at', 'date', 'kickoff'],
     tournament: ['tournament'],
     status: ['status'],
     rank: ['rank'],
-    home_team: ['home_team', 'home', 'match'], // якщо є окрема колонка home_team — використаємо її; інакше 'match'
+    home_team: ['home_team', 'home', 'match'],
     away_team: ['away_team', 'away', 'match'],
   };
 
@@ -27,126 +26,67 @@
     }
   }
 
-  async function getPreferences() {
-    const url = `${ORIGIN}/.netlify/functions/me`;
+  async function fetchPreferences() {
+    const url = `${ORIGIN}/.netlify/functions/preferences`;
     const res = await fetch(url, { credentials: 'include' });
-    if (!res.ok) throw new Error(`GET /me failed: ${res.status}`);
-    const json = await res.json();
-    return json && json.preferences ? json.preferences : {};
+    if (!res.ok) throw new Error(`prefs ${res.status}`);
+    const json = await res.json().catch(() => null);
+    if (!json || !json.ok) throw new Error('bad prefs JSON');
+    return json.data || {};
   }
 
-  function getHeaderMap() {
-    const map = new Map(); // key -> index
-    const ths = document.querySelectorAll('th[data-col]');
-    let idx = 0;
-    ths.forEach(th => {
-      const key = (th.dataset.col || '').trim();
-      if (key) map.set(key, idx);
-      idx++;
-    });
-    return map;
-  }
-
-  function resolveColIndex(targetKey, headerMap) {
-    const candidates = COL_MAP[targetKey] || [targetKey];
-    for (const key of candidates) {
-      if (headerMap.has(key)) return headerMap.get(key);
+  function findColIndexByKeys(thead, keys) {
+    const ths = thead.querySelectorAll('th');
+    for (let i = 0; i < ths.length; i++) {
+      const dc = String(ths[i].dataset.col || '').toLowerCase().trim();
+      if (!dc) continue;
+      for (const k of keys) {
+        if (dc === k) return i;
+      }
     }
     return -1;
   }
 
-  function textOfCell(tr, index) {
-    const td = tr.cells[index];
-    if (!td) return '';
-    // Якщо у TD є data-sort-value — беремо її (OUT OF ARCHITECTURE — див. нижче)
-    const v = td.getAttribute('data-sort-value');
-    return (v != null) ? v : (td.textContent || '').trim();
-  }
-
-  function parseDateLoose(s) {
-    // Підтримка ISO/локальних форматів; якщо NaN — повертаємо null
-    const t = Date.parse(s);
-    return Number.isNaN(t) ? null : t;
-  }
-
-  function makeComparator(index, colKey, order) {
-    const asc = (order || 'asc').toLowerCase() === 'asc';
-    const mul = asc ? 1 : -1;
-
-    if (colKey === 'kickoff_at') {
-      return (a, b) => {
-        const ta = parseDateLoose(textOfCell(a, index));
-        const tb = parseDateLoose(textOfCell(b, index));
-        if (ta == null && tb == null) return 0;
-        if (ta == null) return 1; // пусте в кінець
-        if (tb == null) return -1;
-        return (ta - tb) * (mul * -1); // більша дата вище для desc
-      };
-    }
-
-    // Стрічкове порівняння (укр/пол/англ локалі)
-    return (a, b) => {
-      const sa = textOfCell(a, index).toLowerCase();
-      const sb = textOfCell(b, index).toLowerCase();
-      const cmp = sa.localeCompare(sb, ['uk', 'pl', 'en'], { numeric: true, sensitivity: 'base' });
-      return cmp * mul;
-    };
-  }
-
-  function applySortToTable(colKey, order) {
-    const tbody = document.querySelector(TABLE_SELECTOR);
-    if (!tbody) {
-      log(`Не знайдено ${TABLE_SELECTOR}`, true);
-      return false;
-    }
-    const headerMap = getHeaderMap();
-    const index = resolveColIndex(colKey, headerMap);
-    if (index < 0) {
-      log(`Колонка для '${colKey}' не знайдена у thead[data-col]`, true);
-      return false;
-    }
-
+  function sortRows(tbody, colIndex, dir) {
     const rows = Array.from(tbody.querySelectorAll('tr'));
-    if (!rows.length) {
-      log('Немає рядків для сортування');
-      return false;
-    }
+    const factor = (dir === 'desc') ? -1 : 1;
 
-    const comparator = makeComparator(index, colKey, order);
-    rows.sort(comparator);
+    rows.sort((a, b) => {
+      const aCell = a.children[colIndex]?.textContent?.trim() ?? '';
+      const bCell = b.children[colIndex]?.textContent?.trim() ?? '';
+      if (aCell === bCell) return 0;
+      return aCell > bCell ? factor : -factor;
+    });
 
-    // Перевставляємо у DOM в новому порядку
-    const frag = document.createDocumentFragment();
-    for (const r of rows) frag.appendChild(r);
-    tbody.innerHTML = '';
-    tbody.appendChild(frag);
-
-    log(`Застосовано сортування: ${colKey} ${order}`);
-    return true;
+    rows.forEach(r => tbody.appendChild(r));
   }
 
-  async function run() {
+  async function init() {
     try {
-      // Чекаємо, поки бандл намалює таблицю
-      if (document.readyState === 'loading') {
-        await new Promise(r => document.addEventListener('DOMContentLoaded', r, { once: true }));
-      }
-      // Пауза 0 кадрів, щоб renderMatches встиг відпрацювати
-      await new Promise(r => setTimeout(r, 0));
+      const prefs = await fetchPreferences(); // { sort, sort_col, sort_order, ... }
+      const sortKey = prefs.sort_col || 'kickoff_at';
+      const sortOrder = (prefs.sort_order === 'asc' || prefs.sort_order === 'desc') ? prefs.sort_order : 'desc';
 
-      const prefs = await getPreferences();
-      const col = (prefs.sort_col || '').trim();
-      const ord = (prefs.sort_order || 'asc').trim().toLowerCase();
+      const table = document.querySelector(TABLE_SELECTOR)?.closest('table');
+      if (!table) return log('таблицю не знайдено');
+      const thead = table.querySelector('thead');
+      const tbody = table.querySelector('tbody');
+      if (!thead || !tbody) return log('thead/tbody відсутні');
 
-      if (!col) {
-        log('preferences.sort_col порожній — пропускаємо');
-        return;
-      }
-      applySortToTable(col, ord);
+      const colKeys = COL_MAP[sortKey] || [sortKey];
+      const colIndex = findColIndexByKeys(thead, colKeys);
+      if (colIndex < 0) return log(`колонку для ${sortKey} не знайдено`);
+
+      sortRows(tbody, colIndex, sortOrder);
+      log(`відсортовано за ${sortKey} (${sortOrder})`);
     } catch (e) {
-      log(e.message || String(e), true);
+      log(`помилка сортування: ${e.message || e}`, true);
     }
   }
 
-  run();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
 })();

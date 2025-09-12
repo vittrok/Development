@@ -1,6 +1,6 @@
 // File: public/prefs-init.js
 // Архітектура v1.1: ініціалізація користувацьких преференсів на старті.
-// Підтягує seen_color і застосовує його до "seen"-елементів.
+// Підтягує seen_color і застосовує його до "seen"-елементів з єдиного джерела: /.netlify/functions/preferences.
 
 (function () {
   const ORIGIN = 'https://football-m.netlify.app';
@@ -8,10 +8,11 @@
 
   async function fetchPreferences() {
     try {
-      const res = await fetch(`${ORIGIN}/.netlify/functions/getPreferences`, { credentials: 'include' });
+      const res = await fetch(`${ORIGIN}/.netlify/functions/preferences`, { credentials: 'include' });
       if (!res.ok) return null;
-      const data = await res.json().catch(() => null);
-      return data && data.preferences ? data.preferences : null;
+      const json = await res.json().catch(() => null);
+      if (!json || !json.ok) return null;
+      return json.data || null; // { seen_color, sort, filters, ... }
     } catch {
       return null;
     }
@@ -21,19 +22,11 @@
     const color = (typeof hex === 'string' && hex.trim()) ? hex.trim() : SEEN_FALLBACK;
     // 1) CSS-змінна на :root
     document.documentElement.style.setProperty('--seen-color', color);
-
-    // 2) Мінімальний стиль для "seen"
-    const style = document.createElement('style');
-    style.setAttribute('data-prefs-style', 'seen-color');
-    style.textContent = `
-      .seen, [data-seen="1"], .is-seen, [aria-checked="true"] {
-        background-color: var(--seen-color) !important;
-        transition: background-color .2s ease;
-      }
-    `;
-    const existing = document.head.querySelector('style[data-prefs-style="seen-color"]');
-    if (existing) existing.remove();
-    document.head.appendChild(style);
+    // 2) Якщо у розмітці є елементи з data-seen="1" — підсвітимо
+    const seenNodes = document.querySelectorAll('[data-seen="1"], .seen');
+    seenNodes.forEach(el => {
+      el.style.backgroundColor = color;
+    });
   }
 
   async function init() {
