@@ -1,16 +1,22 @@
 // functions/preferences.js
+//
+// Самодостатня версія з локальними requireOrigin/requireCsrf,
+// щоби не залежати від деталей exports у _auth.js.
+// Залишаємо ваші існуючі _session/_db як є.
 
-// === УТИЛІТИ ТА ЗАЛЕЖНОСТІ (залиште ваші реальні імпорти як є) ===
-const { getSessionFromEvent } = require('./_session');   // ваша реалізація
-const { requireOrigin, requireCsrf } = require('./_auth'); // ваша реалізація
-const { getDb } = require('./_db');                        // ваша реалізація
+// === ІМПОРТИ (підлаштовано під типовий ваш стек) ===
+const { getSessionFromEvent } = require('./_session'); // має повертати { userId, csrf, ... }
+const { getDb } = require('./_db');                    // підключення до БД (pg-promise/pool тощо)
 
-// Дозволені ключі user_preferences.data
+// === КОНСТАНТИ ===
+const APP_ORIGIN = process.env.APP_ORIGIN;
+
+// Дозволені ключі у user_preferences.data
 const ALLOWED_KEYS = new Set([
   'sort', 'sort_col', 'sort_order', 'seen_color', 'filters'
 ]);
 
-// Допоміжний глибокий мердж для простих об’єктів
+// === УТИЛІТИ ===
 function deepMerge(target, src) {
   if (src && typeof src === 'object' && !Array.isArray(src)) {
     for (const k of Object.keys(src)) {
@@ -26,26 +32,42 @@ function deepMerge(target, src) {
   return src;
 }
 
-// НОРМАЛІЗОВАНИЙ парсер JSON-тіла
+// Локальна перевірка Origin: вимагаємо повний збіг з APP_ORIGIN
+function requireOriginLocal(event) {
+  const hdr = event.headers || {};
+  const origin = hdr.origin || hdr.Origin || '';
+  if (!APP_ORIGIN || origin === APP_ORIGIN) {
+    return { ok: true, origin: APP_ORIGIN || origin || '*' };
+  }
+  return { ok: false, origin: APP_ORIGIN, reason: 'forbidden origin' };
+}
+
+// Локальна перевірка CSRF: порівнюємо заголовок X-CSRF із sess.csrf
+function requireCsrfLocal(event, sess) {
+  const hdr = event.headers || {};
+  const x = hdr['x-csrf'] || hdr['X-CSRF'] || hdr['x-Csrf'];
+  if (!x || !sess?.csrf || String(x) !== String(sess.csrf)) {
+    return { ok: false, reason: 'csrf invalid' };
+  }
+  return { ok: true };
+}
+
+// Парсер JSON (підтримка ; charset=..., isBase64Encoded)
 function parseJsonBody(event) {
-  // Деякі клієнти шлють "application/json; charset=utf-8"
   const ct = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
   const isJson = ct.startsWith('application/json');
-
-  if (!isJson) return null; // нехай інші гілки (FORM) обробляються окремо
+  if (!isJson) return null;
 
   let raw = event.body;
   if (event.isBase64Encoded) {
     try {
       raw = Buffer.from(raw || '', 'base64').toString('utf8');
-    } catch (e) {
+    } catch {
       throw new Error('invalid_base64_body');
     }
   }
-  if (typeof raw !== 'string') {
-    // На Netlify event.body має бути рядком; якщо ні — помилка формату
-    throw new Error('invalid_json_body_type');
-  }
+  if (typeof raw !== 'string') throw new Error('invalid_json_body_type');
+
   try {
     return JSON.parse(raw);
   } catch {
@@ -53,7 +75,7 @@ function parseJsonBody(event) {
   }
 }
 
-// Простий парсер x-www-form-urlencoded
+// Парсер x-www-form-urlencoded
 function parseFormBody(event) {
   const ct = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
   const isForm = ct.startsWith('application/x-www-form-urlencoded');
@@ -74,7 +96,7 @@ function parseFormBody(event) {
   return out;
 }
 
-// Відповідь + CORS заголовки
+// Відповіді
 function okJson(body, origin) {
   return {
     statusCode: 200,
@@ -104,16 +126,15 @@ function errText(status, msg, origin) {
   };
 }
 
-exports.handler = async (event, context) => {
-  const APP_ORIGIN = process.env.APP_ORIGIN;
-
-  // CORS preflight
+// === HANDLER ===
+exports.handler = async (event /*, context */) => {
+  // OPTIONS — preflight
   if (event.httpMethod === 'OPTIONS') {
     return {
       statusCode: 204,
       headers: {
         'Content-Type': 'application/json; charset=utf-8',
-        'Access-Control-Allow-Origin': APP_ORIGIN,
+        'Access-Control-Allow-Origin': APP_ORIGIN || '*',
         'Access-Control-Allow-Credentials': 'true',
         'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With, X-CSRF, Cookie',
@@ -123,69 +144,62 @@ exports.handler = async (event, context) => {
     };
   }
 
-  // Перевірки Origin/Session/CSRF (як у вас заведено)
-  const originCheck = requireOrigin(event, APP_ORIGIN);
-  if (!originCheck.ok) {
-    return errText(403, 'forbidden origin', APP_ORIGIN);
-  }
+  // Origin
+  const o = requireOriginLocal(event);
+  if (!o.ok) return errText(403, 'forbidden origin', o.origin);
+
+  // Session
   const sess = await getSessionFromEvent(event);
-  if (!sess?.userId) {
-    return errText(401, 'unauthorized', APP_ORIGIN);
-  }
+  if (!sess?.userId) return errText(401, 'unauthorized', o.origin);
 
   if (event.httpMethod === 'GET') {
-    // Витягнути preferences.data з БД
     const db = await getDb();
     const row = await db.oneOrNone(
       `select data from user_preferences where user_id = $1`,
       [sess.userId]
     );
     const data = row?.data || {};
-    return okJson({ ok: true, data }, APP_ORIGIN);
+    return okJson({ ok: true, data }, o.origin);
   }
 
   if (event.httpMethod === 'POST') {
     // CSRF
-    const csrf = requireCsrf(event, sess);
-    if (!csrf.ok) {
-      return errText(401, 'csrf invalid', APP_ORIGIN);
-    }
+    const c = requireCsrfLocal(event, sess);
+    if (!c.ok) return errText(401, 'csrf invalid', o.origin);
 
-    // Тіло: пробуємо JSON, інакше FORM
+    // Body: JSON або FORM
     let patch = null;
     try {
       patch = parseJsonBody(event);
     } catch (e) {
       if (e.message === 'invalid_base64_body' || e.message === 'invalid_json_body' || e.message === 'invalid_json_body_type') {
-        return errText(400, 'Invalid JSON body', APP_ORIGIN);
+        return errText(400, 'Invalid JSON body', o.origin);
       }
-      return errText(400, 'Bad Request', APP_ORIGIN);
+      return errText(400, 'Bad Request', o.origin);
     }
     if (patch == null) {
-      // Не JSON — пробуємо FORM
       patch = parseFormBody(event);
       if (patch == null) {
-        return errText(415, 'Unsupported Media Type', APP_ORIGIN);
+        return errText(415, 'Unsupported Media Type', o.origin);
       }
     }
 
-    // White-list: прибираємо невідомі ключі
+    // White-list ключів верхнього рівня
     const sanitized = {};
     for (const k of Object.keys(patch)) {
       if (ALLOWED_KEYS.has(k)) sanitized[k] = patch[k];
     }
-    // Якщо прийшли внутрішні під-об’єкти (напр. filters), дозволяємо як є
 
     const db = await getDb();
 
-    // Читаємо поточні
+    // Поточні дані
     const row = await db.oneOrNone(
       `select data from user_preferences where user_id = $1`,
       [sess.userId]
     );
     const current = row?.data || {};
 
-    // Мерджимо
+    // Мердж
     const merged = deepMerge({ ...current }, sanitized);
 
     // UPSERT
@@ -199,8 +213,8 @@ exports.handler = async (event, context) => {
       [sess.userId, merged]
     );
 
-    return okJson({ ok: true, data: merged }, APP_ORIGIN);
+    return okJson({ ok: true, data: merged }, o.origin);
   }
 
-  return errText(405, 'method not allowed', APP_ORIGIN);
+  return errText(405, 'method not allowed', o.origin);
 };
