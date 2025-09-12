@@ -1,76 +1,84 @@
-// matches/netlify-prod/src/api/preferences.js
+// File: functions/preferences.js
+// Мінімальна робоча версія з коректним експортом handler,
+// щоб зняти 502 "handler is undefined". Далі нарощуватимемо логіку за v1.1.
 //
-// Єдиний клієнт для налаштувань:
-//  - getPreferences(): GET /.netlify/functions/preferences
-//  - savePreferences(patch): POST /.netlify/functions/preferences (JSON)
-// Примітки:
-//  - Перед POST знімаємо CSRF через /me
-//  - Кукі-сесія додається через credentials: 'include'
-//  - Жодних паролів/секретів у коді (правило 13)
+// Поведінка:
+// - OPTIONS → 204 + CORS
+// - GET     → 200 { ok: true, data: {} }  (тимчасово пусто; не суперечить архітектурі, дані додамо на наступних кроках)
+// - POST    → 200 { ok: true }            (тимчасова заглушка; підтверджує прийом)
+//
+// ВАЖЛИВО: без хардкоду логін/пароль; без зміни БД.
+// Це лише відновлення працездатності ендпойнта.
 
-const FN_BASE = '/.netlify/functions';
+const ALLOWED_ORIGIN = 'https://football-m.netlify.app';
 
-async function getCsrf() {
-  const res = await fetch(`${FN_BASE}/me`, {
-    method: 'GET',
-    credentials: 'include',
-    headers: {
-      // Origin важливий для бек-перевірки
-      'Origin': window.location.origin
-    }
-  });
-  if (!res.ok) {
-    throw new Error(`GET /me failed: ${res.status}`);
-  }
-  const j = await res.json();
-  if (!j?.csrf) {
-    throw new Error('No CSRF in /me (are you logged in?)');
-  }
-  return j.csrf;
+function corsHeaders(origin) {
+  return {
+    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With, X-CSRF',
+    Vary: 'Origin',
+  };
 }
 
-export async function getPreferences() {
-  const res = await fetch(`${FN_BASE}/preferences`, {
-    method: 'GET',
-    credentials: 'include',
+function json(status, body) {
+  return {
+    statusCode: status,
     headers: {
-      'Origin': window.location.origin
-    }
-  });
-  if (!res.ok) {
-    throw new Error(`GET /preferences failed: ${res.status}`);
-  }
-  const j = await res.json();
-  return j?.data ?? {};
-}
-
-export async function savePreferences(patch) {
-  const csrf = await getCsrf();
-
-  const res = await fetch(`${FN_BASE}/preferences`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: {
-      'Origin': window.location.origin,
-      'Content-Type': 'application/json',
-      'X-CSRF': csrf
+      ...corsHeaders(ALLOWED_ORIGIN),
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-cache',
     },
-    body: JSON.stringify(patch || {})
-  });
-
-  if (res.status === 401) {
-    const msg = await res.text();
-    throw new Error(`Unauthorized: ${msg}`);
-  }
-  if (res.status === 403) {
-    const msg = await res.text();
-    throw new Error(`Forbidden (Origin): ${msg}`);
-  }
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`POST /preferences failed: ${res.status} ${txt}`);
-  }
-
-  const j = await res.json();
-  return j?.data ?? {};
+    body: JSON.stringify(body),
+  };
 }
+
+function noContent() {
+  return {
+    statusCode: 204,
+    headers: {
+      ...corsHeaders(ALLOWED_ORIGIN),
+      'Cache-Control': 'no-cache',
+    },
+    body: '',
+  };
+}
+
+exports.handler = async function handler(event /*, context */) {
+  try {
+    // CORS preflight
+    if (event.httpMethod === 'OPTIONS') {
+      return noContent();
+    }
+
+    // Тимчасово дозволяємо лише прод-оріджин
+    const origin = event.headers?.origin || event.headers?.Origin || '';
+    if (origin && origin !== ALLOWED_ORIGIN) {
+      // Для простоти: відповідаємо 403, щоби явно не плутатись
+      return json(403, { ok: false, error: 'forbidden_origin' });
+    }
+
+    if (event.httpMethod === 'GET') {
+      // TODO(next steps): зчитати preferences з БД за session
+      return json(200, { ok: true, data: {} });
+    }
+
+    if (event.httpMethod === 'POST') {
+      // TODO(next steps): валідувати X-CSRF, змерджити data у БД
+      // Переконаємося, що це валідний JSON (щоб уникнути 500 при кривому body)
+      try {
+        if (event.body && typeof event.body === 'string') {
+          JSON.parse(event.body);
+        }
+      } catch {
+        return json(400, { ok: false, error: 'invalid_json' });
+      }
+      return json(200, { ok: true });
+    }
+
+    return json(405, { ok: false, error: 'method_not_allowed' });
+  } catch (e) {
+    return json(500, { ok: false, error: 'internal_error', detail: String(e && e.message || e) });
+  }
+};
