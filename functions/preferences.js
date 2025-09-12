@@ -1,238 +1,206 @@
-// File: functions/preferences.js
-// GET  /preferences  -> повертає data (jsonb) для поточного користувача
-// POST /preferences  -> мерджить payload у user_preferences.data (jsonb)
-// Захист (арх. v1.1): session cookie + CSRF + Origin whitelist (для POST)
+// functions/preferences.js
 
-const { Pool } = require("pg");
-const crypto = require("crypto");
-const querystring = require("querystring");
+// === УТИЛІТИ ТА ЗАЛЕЖНОСТІ (залиште ваші реальні імпорти як є) ===
+const { getSessionFromEvent } = require('./_session');   // ваша реалізація
+const { requireOrigin, requireCsrf } = require('./_auth'); // ваша реалізація
+const { getDb } = require('./_db');                        // ваша реалізація
 
-const {
-  APP_ORIGIN,
-  DATABASE_URL,
-  SESSION_SECRET,
-  CSRF_SECRET,
-} = process.env;
+// Дозволені ключі user_preferences.data
+const ALLOWED_KEYS = new Set([
+  'sort', 'sort_col', 'sort_order', 'seen_color', 'filters'
+]);
 
-const ORIGIN = APP_ORIGIN || "https://football-m.netlify.app";
+// Допоміжний глибокий мердж для простих об’єктів
+function deepMerge(target, src) {
+  if (src && typeof src === 'object' && !Array.isArray(src)) {
+    for (const k of Object.keys(src)) {
+      const v = src[k];
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        target[k] = deepMerge(target[k] ?? {}, v);
+      } else {
+        target[k] = v;
+      }
+    }
+    return target;
+  }
+  return src;
+}
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Allow-Origin": ORIGIN,
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Requested-With, X-CSRF, Cookie",
-    "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
-    "Cache-Control": "no-cache",
-    "Content-Type": "application/json; charset=utf-8",
-  };
+// НОРМАЛІЗОВАНИЙ парсер JSON-тіла
+function parseJsonBody(event) {
+  // Деякі клієнти шлють "application/json; charset=utf-8"
+  const ct = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
+  const isJson = ct.startsWith('application/json');
+
+  if (!isJson) return null; // нехай інші гілки (FORM) обробляються окремо
+
+  let raw = event.body;
+  if (event.isBase64Encoded) {
+    try {
+      raw = Buffer.from(raw || '', 'base64').toString('utf8');
+    } catch (e) {
+      throw new Error('invalid_base64_body');
+    }
+  }
+  if (typeof raw !== 'string') {
+    // На Netlify event.body має бути рядком; якщо ні — помилка формату
+    throw new Error('invalid_json_body_type');
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error('invalid_json_body');
+  }
 }
-function json(status, obj) {
-  return { statusCode: status, headers: corsHeaders(), body: JSON.stringify(obj) };
-}
-function text(status, body) {
-  return { statusCode: status, headers: { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8" }, body };
-}
-function normStr(v) {
-  return typeof v === "string" ? v.trim() : "";
-}
-function parseCookies(header) {
+
+// Простий парсер x-www-form-urlencoded
+function parseFormBody(event) {
+  const ct = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
+  const isForm = ct.startsWith('application/x-www-form-urlencoded');
+  if (!isForm) return null;
+
+  let raw = event.body || '';
+  if (event.isBase64Encoded) {
+    raw = Buffer.from(raw, 'base64').toString('utf8');
+  }
   const out = {};
-  if (!header) return out;
-  for (const part of String(header).split(/;\s*/)) {
-    const i = part.indexOf("=");
-    if (i > 0) out[part.slice(0, i)] = part.slice(i + 1);
+  for (const pair of raw.split('&')) {
+    if (!pair) continue;
+    const [k, v] = pair.split('=');
+    const key = decodeURIComponent(k || '').trim();
+    const val = decodeURIComponent(v || '').trim();
+    if (key) out[key] = val;
   }
   return out;
 }
-function parseSidSig(cookieVal) {
-  if (!cookieVal) return null;
-  const dot = cookieVal.lastIndexOf(".");
-  if (dot <= 0) return null;
-  const sid = cookieVal.slice(0, dot);
-  const sig = cookieVal.slice(dot + 1);
-  return { sid, sig };
+
+// Відповідь + CORS заголовки
+function okJson(body, origin) {
+  return {
+    statusCode: 200,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': origin,
+      'Access-Control-Allow-Credentials': 'true',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With, X-CSRF, Cookie',
+      'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
+    },
+    body: JSON.stringify(body),
+  };
 }
-function timingSafeEq(a, b) {
-  const aa = Buffer.from(String(a) || "");
-  const bb = Buffer.from(String(b) || "");
-  if (aa.length !== bb.length) return false;
-  return crypto.timingSafeEqual(aa, bb);
-}
-function hmacHex(secret, data) {
-  return crypto.createHmac("sha256", String(secret)).update(String(data)).digest("hex");
+function errText(status, msg, origin) {
+  return {
+    statusCode: status,
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Access-Control-Allow-Origin': origin,
+      'Access-Control-Allow-Credentials': 'true',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With, X-CSRF, Cookie',
+      'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
+    },
+    body: msg,
+  };
 }
 
-let _pool = null;
-function pool() {
-  if (!_pool) {
-    _pool = new Pool({
-      connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-    });
+exports.handler = async (event, context) => {
+  const APP_ORIGIN = process.env.APP_ORIGIN;
+
+  // CORS preflight
+  if (event.httpMethod === 'OPTIONS') {
+    return {
+      statusCode: 204,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Access-Control-Allow-Origin': APP_ORIGIN,
+        'Access-Control-Allow-Credentials': 'true',
+        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With, X-CSRF, Cookie',
+        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
+      },
+      body: '',
+    };
   }
-  return _pool;
-}
 
-function getOrigin(event) {
-  return event.headers["origin"] || event.headers["Origin"] || "";
-}
-function isAllowedOrigin(origin) {
-  // єдиний дозволений origin з архітектури
-  return normStr(origin) === ORIGIN;
-}
+  // Перевірки Origin/Session/CSRF (як у вас заведено)
+  const originCheck = requireOrigin(event, APP_ORIGIN);
+  if (!originCheck.ok) {
+    return errText(403, 'forbidden origin', APP_ORIGIN);
+  }
+  const sess = await getSessionFromEvent(event);
+  if (!sess?.userId) {
+    return errText(401, 'unauthorized', APP_ORIGIN);
+  }
 
-async function getUserFromSession(event) {
-  const raw = event.headers?.cookie || event.headers?.Cookie || "";
-  const cookies = parseCookies(raw);
-  const session = cookies["session"] || "";
-  const parsed = parseSidSig(session) || {};
-  const sid = normStr(parsed.sid);
-  const sig = normStr(parsed.sig);
-
-  if (!sid || !sig || !SESSION_SECRET) return null;
-  const goodSig = hmacHex(SESSION_SECRET, sid);
-  if (!timingSafeEq(goodSig, sig)) return null;
-
-  const cli = await pool().connect();
-  try {
-    const r = await cli.query(
-      `SELECT s.user_id, s.expires_at, s.revoked
-         FROM sessions s
-        WHERE s.sid = $1`,
-      [sid]
+  if (event.httpMethod === 'GET') {
+    // Витягнути preferences.data з БД
+    const db = await getDb();
+    const row = await db.oneOrNone(
+      `select data from user_preferences where user_id = $1`,
+      [sess.userId]
     );
-    if (!r.rowCount) return null;
-    const row = r.rows[0];
-    if (row.revoked) return null;
-    if (!row.expires_at || new Date(row.expires_at) <= new Date()) return null;
-    return { user_id: row.user_id, sid };
-  } finally {
-    cli.release();
+    const data = row?.data || {};
+    return okJson({ ok: true, data }, APP_ORIGIN);
   }
-}
 
-function parseBody(event) {
-  const ct = String(event.headers["content-type"] || event.headers["Content-Type"] || "").toLowerCase();
-  const raw = event.body || "";
-  if (!raw) return {};
+  if (event.httpMethod === 'POST') {
+    // CSRF
+    const csrf = requireCsrf(event, sess);
+    if (!csrf.ok) {
+      return errText(401, 'csrf invalid', APP_ORIGIN);
+    }
 
-  if (ct.includes("application/json")) {
+    // Тіло: пробуємо JSON, інакше FORM
+    let patch = null;
     try {
-      return JSON.parse(raw);
-    } catch {
-      // нехай клієнт бачить зрозумілу помилку
-      throw new Error("Invalid JSON body");
-    }
-  }
-  if (ct.includes("application/x-www-form-urlencoded")) {
-    return querystring.parse(raw);
-  }
-  // інше ігноруємо
-  return {};
-}
-
-exports.handler = async (event) => {
-  try {
-    // CORS preflight
-    if (event.httpMethod === "OPTIONS") {
-      return { statusCode: 204, headers: corsHeaders(), body: "" };
-    }
-
-    // GET: дозволяємо анонімний рідер (повертаємо дефолт)
-    if (event.httpMethod === "GET") {
-      const u = await getUserFromSession(event);
-      if (!u) {
-        // анонім: повертаємо дефолт/публічні фільтри — без персональних даних
-        return json(200, { ok: true, data: { sort: "date_desc", filters: { league: "EPL" } } });
-      }
-
-      const cli = await pool().connect();
-      try {
-        const r = await cli.query(
-          `SELECT data FROM user_preferences WHERE user_id = $1 LIMIT 1`,
-          [u.user_id]
-        );
-        const data = r.rowCount ? r.rows[0].data || {} : {};
-        // Мінімальний дефолт, якщо порожньо
-        const merged = { sort: "date_desc", filters: { league: "EPL" }, ...data };
-        return json(200, { ok: true, data: merged });
-      } finally {
-        cli.release();
-      }
-    }
-
-    if (event.httpMethod !== "POST") {
-      return json(405, { ok: false, error: "Method Not Allowed" });
-    }
-
-    // POST: 1) Origin whitelist
-    const origin = getOrigin(event);
-    if (!isAllowedOrigin(origin)) {
-      // важливо: повертаємо 200? Ні — краще 403, щоб тести відловлювали
-      return text(403, "forbidden origin");
-    }
-
-    // 2) Сесія обов’язкова
-    const u = await getUserFromSession(event);
-    if (!u) {
-      return text(401, "unauthorized");
-    }
-
-    // 3) CSRF = HMAC(CSRF_SECRET, sid) — обов’язковий
-    const csrfHeader = normStr(event.headers["x-csrf"] || event.headers["X-CSRF"] || "");
-    if (!csrfHeader || !CSRF_SECRET) {
-      return text(401, "csrf required");
-    }
-    const goodCsrf = hmacHex(CSRF_SECRET, u.sid);
-    if (!timingSafeEq(goodCsrf, csrfHeader)) {
-      return text(401, "csrf invalid");
-    }
-
-    // 4) Body
-    let payload = {};
-    try {
-      payload = parseBody(event);
+      patch = parseJsonBody(event);
     } catch (e) {
-      return text(400, e.message || "bad request");
+      if (e.message === 'invalid_base64_body' || e.message === 'invalid_json_body' || e.message === 'invalid_json_body_type') {
+        return errText(400, 'Invalid JSON body', APP_ORIGIN);
+      }
+      return errText(400, 'Bad Request', APP_ORIGIN);
     }
-
-    // Простий whitelist: дозволяємо тільки кілька ключів (можна розширити у майбутньому)
-    const allowed = ["seen_color", "sort", "sort_col", "sort_order", "filters"];
-    const clean = {};
-    for (const k of allowed) {
-      if (Object.prototype.hasOwnProperty.call(payload, k)) {
-        clean[k] = payload[k];
+    if (patch == null) {
+      // Не JSON — пробуємо FORM
+      patch = parseFormBody(event);
+      if (patch == null) {
+        return errText(415, 'Unsupported Media Type', APP_ORIGIN);
       }
     }
 
-    // 5) Merge у jsonb
-    const cli = await pool().connect();
-    try {
-      await cli.query(
-        `
-        INSERT INTO user_preferences (user_id, data)
-        VALUES ($1, $2::jsonb)
-        ON CONFLICT (user_id) DO UPDATE
-          SET data = user_preferences.data || EXCLUDED.data,
-              updated_at = now()
-        `,
-        [u.user_id, JSON.stringify(clean)]
-      );
-
-      const r2 = await cli.query(
-        `SELECT data FROM user_preferences WHERE user_id = $1 LIMIT 1`,
-        [u.user_id]
-      );
-      const data = r2.rowCount ? r2.rows[0].data || {} : {};
-      // додамо мінімальні дефолти зверху
-      const merged = { sort: "date_desc", filters: { league: "EPL" }, ...data };
-      return json(200, { ok: true, data: merged });
-    } finally {
-      cli.release();
+    // White-list: прибираємо невідомі ключі
+    const sanitized = {};
+    for (const k of Object.keys(patch)) {
+      if (ALLOWED_KEYS.has(k)) sanitized[k] = patch[k];
     }
-  } catch (e) {
-    console.error("[/preferences] fatal:", e);
-    return text(500, "internal");
+    // Якщо прийшли внутрішні під-об’єкти (напр. filters), дозволяємо як є
+
+    const db = await getDb();
+
+    // Читаємо поточні
+    const row = await db.oneOrNone(
+      `select data from user_preferences where user_id = $1`,
+      [sess.userId]
+    );
+    const current = row?.data || {};
+
+    // Мерджимо
+    const merged = deepMerge({ ...current }, sanitized);
+
+    // UPSERT
+    await db.none(
+      `
+      insert into user_preferences (user_id, data, created_at, updated_at)
+      values ($1, $2::jsonb, now(), now())
+      on conflict (user_id)
+      do update set data = EXCLUDED.data, updated_at = now()
+      `,
+      [sess.userId, merged]
+    );
+
+    return okJson({ ok: true, data: merged }, APP_ORIGIN);
   }
+
+  return errText(405, 'method not allowed', APP_ORIGIN);
 };
