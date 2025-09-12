@@ -1,14 +1,16 @@
 // functions/preferences.js
 //
-// Самодостатня версія з локальними перевірками Origin/CSRF
-// і викликом getSession(event) з ./_session (у вас саме такий експорт).
+// Єдиний ендпоїнт /preferences з локальними перевірками Origin/CSRF.
+// Приймає application/json (з charset, base64) та application/x-www-form-urlencoded.
+// Використовує ваш getSession(event) з ./_session.
+// Мерджить дані у user_preferences.data (jsonb).
 
 const { getSession } = require('./_session');
 const { getDb } = require('./_db');
 
 const APP_ORIGIN = process.env.APP_ORIGIN;
 
-// Дозволені ключі у user_preferences.data
+// Дозволені ключі у user_preferences.data (верхній рівень)
 const ALLOWED_KEYS = new Set(['sort', 'sort_col', 'sort_order', 'seen_color', 'filters']);
 
 // ---------- УТИЛІТИ ----------
@@ -110,6 +112,20 @@ function errText(status, msg, origin) {
   };
 }
 
+// Адаптивний витяг userId зі сесії
+function extractUserId(sess) {
+  if (!sess || typeof sess !== 'object') return null;
+  return (
+    sess.userId ??
+    sess.user_id ??
+    (sess.user && (sess.user.id ?? sess.user.user_id)) ??
+    sess.uid ??
+    sess.sub ??
+    sess.id ??
+    null
+  );
+}
+
 // ---------- HANDLER ----------
 exports.handler = async (event /*, context */) => {
   // Preflight
@@ -132,13 +148,14 @@ exports.handler = async (event /*, context */) => {
   const o = requireOriginLocal(event);
   if (!o.ok) return errText(403, 'forbidden origin', o.origin);
 
-  // Session (ВАЖЛИВО: у вас експорт саме getSession; вона приймає event)
+  // Session
   const sess = await getSession(event);
-  if (!sess?.userId) return errText(401, 'unauthorized', o.origin);
+  const userId = extractUserId(sess);
+  if (!userId) return errText(401, 'unauthorized', o.origin);
 
   if (event.httpMethod === 'GET') {
     const db = await getDb();
-    const row = await db.oneOrNone(`select data from user_preferences where user_id = $1`, [sess.userId]);
+    const row = await db.oneOrNone(`select data from user_preferences where user_id = $1`, [userId]);
     const data = row?.data || {};
     return okJson({ ok: true, data }, o.origin);
   }
@@ -172,7 +189,7 @@ exports.handler = async (event /*, context */) => {
     const db = await getDb();
 
     // Поточні значення
-    const row = await db.oneOrNone(`select data from user_preferences where user_id = $1`, [sess.userId]);
+    const row = await db.oneOrNone(`select data from user_preferences where user_id = $1`, [userId]);
     const current = row?.data || {};
 
     // Мердж
@@ -184,7 +201,7 @@ exports.handler = async (event /*, context */) => {
        values ($1, $2::jsonb, now(), now())
        on conflict (user_id) do update
        set data = EXCLUDED.data, updated_at = now()`,
-      [sess.userId, merged]
+      [userId, merged]
     );
 
     return okJson({ ok: true, data: merged }, o.origin);
