@@ -1,71 +1,137 @@
-// Повертає список матчів. Авторизація через HOF у _auth.js.
-// Без зайвих логів — відповідає вимогам архітектури.
+// functions/getMatches.js
+// Бекенд-сортування з урахуванням пер-юзерних преференсів, збережених у user_preferences (jsonb).
+// Якщо користувач неавторизований або немає збережених ключів -> дефолтне сортування за kickoff_at ASC.
+//
+// Публічний доступ: так (не вимагаємо обов'язкового логіну для перегляду).
+// Персоналізація сортування: так, якщо є валідна сесія.
+//
+// Залежності: _utils.getPool, _utils.corsHeaders, _session.verifySigned/_session.extractSigned
+//             (узгоджено з вашим поточним кодом стилю /me.js)
 
-const { requireAuth } = require('./_auth');
-const { corsHeaders } = require('./_utils');
-const { getClient } = require('./_db');
+const { getPool, corsHeaders } = require('./_utils');
+const { verifySigned, extractSigned } = require('./_session');
 
-async function coreGetMatches() {
-  const client = getClient();
-  try {
-    await client.connect();
+const pool = getPool();
 
-    const p = await client.query("SELECT sort_col, sort_order FROM preferences LIMIT 1");
+// БІЛИЙ СПИСОК видимих для сортування колонок (map "ключ преференса" -> "ім'я колонки в БД")
+const ORDERABLE = {
+  kickoff_at:  'kickoff_at',
+  rank:        'rank',
+  tournament:  'tournament',
+  league:      'league',
+  status:      'status',
+  home_team:   'home_team',
+  away_team:   'away_team',
+  // якщо у вас є інші безпечні колонки для ORDER BY — додайте тут
+};
 
-    let sortCol = 'date', sortOrder = 'asc';
-    const allowed = ['rank','match','tournament','date','link','seen','comments','kickoff_at'];
-    if (p.rowCount) {
-      const col = p.rows[0].sort_col;
-      const ord = p.rows[0].sort_order;
-      if (allowed.includes(col)) sortCol = col;
-      if (ord === 'desc') sortOrder = 'desc';
-    }
+// Дефолти коли немає перс. префів
+const DEFAULT_SORT_COL  = 'kickoff_at';
+const DEFAULT_SORT_DIR  = 'asc'; // 'asc' або 'desc'
 
-    const rows = await client.query(`
-      SELECT rank, match, tournament, date, link, seen, comments
-      FROM matches
-      ORDER BY ${sortCol} ${sortOrder} NULLS LAST, rank ASC
-    `);
-
-    const matches = rows.rows.map(r => ({
-      rank: r.rank,
-      match: r.match,
-      tournament: r.tournament,
-      date: r.date instanceof Date ? r.date.toISOString().slice(0,10) : r.date,
-      link: r.link,
-      seen: r.seen,
-      comments: r.comments
-    }));
-
-    return {
-      statusCode: 200,
-      headers: { 'content-type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({ matches, sort: { column: sortCol, order: sortOrder } })
-    };
-  } finally {
-    await client.end();
-  }
+function json(status, body) {
+  return {
+    statusCode: status,
+    headers: { ...corsHeaders(), 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify(body),
+  };
 }
 
-exports.handler = async function handler(event, context) {
+async function getUserIdFromCookie(event) {
+  // Дістаємо підписану куку "session=<sid>.<sig>" і верифікуємо
+  const signed = extractSigned(event);
+  if (!signed) return null;
+  const verified = verifySigned(signed); // { sid } | null
+  if (!verified || !verified.sid) return null;
+
+  // По sid — user_id із sessions
+  const { rows } = await pool.query(
+    `SELECT user_id, revoked, expires_at
+       FROM sessions
+      WHERE sid = $1
+      LIMIT 1`,
+    [verified.sid]
+  );
+  if (!rows.length) return null;
+  const r = rows[0];
+  if (r.revoked) return null;
+  if (!r.expires_at || new Date(r.expires_at) <= new Date()) return null;
+  return r.user_id || null;
+}
+
+async function getUserSortPrefs(userId) {
+  // Читаємо jsonb з user_preferences
+  const { rows } = await pool.query(
+    `SELECT data
+       FROM user_preferences
+      WHERE user_id = $1
+      LIMIT 1`,
+    [userId]
+  );
+  if (!rows.length) return null;
+  const data = rows[0].data || {};
+  const sort_col   = typeof data.sort_col === 'string'   ? data.sort_col   : null;
+  const sort_order = typeof data.sort_order === 'string' ? data.sort_order : null;
+
+  // Back-compat: якщо є єдиний рядок "sort":"kickoff_at_desc"
+  if (!sort_col && typeof data.sort === 'string') {
+    const m = /^([a-z_]+)_(asc|desc)$/i.exec(data.sort);
+    if (m) return { sort_col: m[1].toLowerCase(), sort_order: m[2].toLowerCase() };
+  }
+  if (!sort_col || !sort_order) return null;
+  return { sort_col: sort_col.toLowerCase(), sort_order: sort_order.toLowerCase() };
+}
+
+function buildOrderBy(sort_col, sort_order) {
+  // Захист від SQL injection: беремо лише з білого списку
+  const col = ORDERABLE[sort_col] || ORDERABLE[DEFAULT_SORT_COL];
+  const dir = sort_order === 'desc' ? 'DESC' : 'ASC';
+  return `ORDER BY ${col} ${dir}, id ASC`; // другорядне стабілізуюче сортування
+}
+
+exports.handler = async (event) => {
+  // CORS preflight
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: corsHeaders() };
+    return { statusCode: 204, headers: corsHeaders(), body: '' };
   }
   if (event.httpMethod !== 'GET') {
-    return { statusCode: 405, headers: corsHeaders(), body: 'method not allowed' };
+    return json(405, { ok:false, error:'method_not_allowed' });
   }
 
   try {
-    const authed = requireAuth(async () => {
-      return await coreGetMatches();
-    });
-    const res = await authed(event, context);
-    return { ...res, headers: { ...corsHeaders(), ...(res.headers || {}) } };
+    // 1) Дістаємо user_id (якщо є)
+    let userId = null;
+    try {
+      userId = await getUserIdFromCookie(event);
+    } catch {
+      userId = null;
+    }
+
+    // 2) Визначаємо сортування
+    let sort_col  = DEFAULT_SORT_COL;
+    let sort_order = DEFAULT_SORT_DIR;
+
+    if (userId) {
+      const prefs = await getUserSortPrefs(userId);
+      if (prefs && ORDERABLE[prefs.sort_col] && (prefs.sort_order === 'asc' || prefs.sort_order === 'desc')) {
+        sort_col = prefs.sort_col;
+        sort_order = prefs.sort_order;
+      }
+    }
+
+    const orderBy = buildOrderBy(sort_col, sort_order);
+
+    // 3) Тягнемо матчі. Мінімізуємо припущення щодо схеми: витягуємо ключові колонки + id.
+    const sql = `
+      SELECT id, kickoff_at, league, status, home_team, away_team, tournament, rank, link
+        FROM matches
+       ${orderBy}
+       LIMIT 500
+    `;
+    const { rows } = await pool.query(sql, []);
+
+    return json(200, { ok:true, items: rows, sort_applied: { sort_col, sort_order } });
   } catch (e) {
-    return {
-      statusCode: 500,
-      headers: corsHeaders(),
-      body: JSON.stringify({ ok: false, error: String(e?.message || e) })
-    };
+    return json(500, { ok:false, error:'internal_error', detail: String(e?.message || e) });
   }
 };
