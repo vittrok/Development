@@ -16,7 +16,11 @@ const pool = getPool();
 const APP_ORIGIN = process.env.APP_ORIGIN || 'https://football-m.netlify.app';
 const CSRF_SECRET = process.env.CSRF_SECRET || '';
 
-const ALLOWED_COLS = ['rank','match','tournament','date','link','seen','comments','kickoff_at','home_team','away_team','status'];
+/** ДОДАНО: 'league' у білий список */
+const ALLOWED_COLS = [
+  'rank','match','tournament','date','link','seen','comments',
+  'kickoff_at','home_team','away_team','status','league'
+];
 const ALLOWED_ORDS = ['asc','desc'];
 
 function json(status, body) {
@@ -66,7 +70,7 @@ async function getPrefs(userId) {
   if (typeof data.seen_color === 'string') out.seen_color = data.seen_color;
   if (typeof data.sort_col === 'string')   out.sort_col   = data.sort_col;
   if (typeof data.sort_order === 'string') out.sort_order = data.sort_order;
-  // Back-compat: якщо є data.sort = "date_desc" → розкласти (опц.)
+  // Back-compat
   if (!out.sort_col && typeof data.sort === 'string') {
     const m = /^([a-z_]+)_(asc|desc)$/i.exec(data.sort);
     if (m) { out.sort_col = m[1]; out.sort_order = m[2].toLowerCase(); }
@@ -127,7 +131,7 @@ async function _handler(event) {
   }
 
   if (event.httpMethod === 'POST') {
-    // CSRF: очікуємо X-CSRF = HMAC(CSRF_SECRET, sid) (hex), як у /me
+    // CSRF: X-CSRF = HMAC(CSRF_SECRET, sid) (hex), як у /me
     const hdrs = event.headers || {};
     const csrf = hdrs['x-csrf'] || hdrs['X-CSRF'] || hdrs['x-csrf-token'] || hdrs['X-CSRF-Token'];
     const expected = CSRF_SECRET ? hmacHex(CSRF_SECRET, sid) : null;
@@ -169,7 +173,7 @@ async function _handler(event) {
     }
     if (payload.sort_order != null) {
       const ord = String(payload.sort_order).trim().toLowerCase();
-      if (!['asc','desc'].includes(ord)) return json(400, { ok:false, error:'invalid_sort_order' });
+      if (!ALLOWED_ORDS.includes(ord)) return json(400, { ok:false, error:'invalid_sort_order' });
       patch.sort_order = ord;
     }
     if (!Object.keys(patch).length) {
