@@ -6,26 +6,23 @@
 // Персоналізація сортування: так, якщо є валідна сесія.
 //
 // Залежності: _utils.getPool, _utils.corsHeaders, _session.verifySigned/_session.extractSigned
-//             (узгоджено з вашим поточним кодом стилю /me.js)
 
 const { getPool, corsHeaders } = require('./_utils');
 const { verifySigned, extractSigned } = require('./_session');
 
 const pool = getPool();
 
-// БІЛИЙ СПИСОК видимих для сортування колонок (map "ключ преференса" -> "ім'я колонки в БД")
+// БІЛИЙ СПИСОК колонок для ORDER BY (ключ преференса -> назва колонки в БД)
 const ORDERABLE = {
   kickoff_at:  'kickoff_at',
   rank:        'rank',
   tournament:  'tournament',
-  league:      'league',
+  league:      'league',      // <- важливо: додано 'league'
   status:      'status',
   home_team:   'home_team',
   away_team:   'away_team',
-  // якщо у вас є інші безпечні колонки для ORDER BY — додайте тут
 };
 
-// Дефолти коли немає перс. префів
 const DEFAULT_SORT_COL  = 'kickoff_at';
 const DEFAULT_SORT_DIR  = 'asc'; // 'asc' або 'desc'
 
@@ -38,13 +35,12 @@ function json(status, body) {
 }
 
 async function getUserIdFromCookie(event) {
-  // Дістаємо підписану куку "session=<sid>.<sig>" і верифікуємо
-  const signed = extractSigned(event);
+  const signed = extractSigned(event);           // читає Cookie: session=<sid>.<sig>
   if (!signed) return null;
-  const verified = verifySigned(signed); // { sid } | null
+  const verified = verifySigned(signed);         // { sid } | null
   if (!verified || !verified.sid) return null;
 
-  // По sid — user_id із sessions
+  // По sid — шукаємо user_id в sessions
   const { rows } = await pool.query(
     `SELECT user_id, revoked, expires_at
        FROM sessions
@@ -73,7 +69,7 @@ async function getUserSortPrefs(userId) {
   const sort_col   = typeof data.sort_col === 'string'   ? data.sort_col   : null;
   const sort_order = typeof data.sort_order === 'string' ? data.sort_order : null;
 
-  // Back-compat: якщо є єдиний рядок "sort":"kickoff_at_desc"
+  // Back-compat: єдиний рядок "sort":"kickoff_at_desc"
   if (!sort_col && typeof data.sort === 'string') {
     const m = /^([a-z_]+)_(asc|desc)$/i.exec(data.sort);
     if (m) return { sort_col: m[1].toLowerCase(), sort_order: m[2].toLowerCase() };
@@ -83,7 +79,7 @@ async function getUserSortPrefs(userId) {
 }
 
 function buildOrderBy(sort_col, sort_order) {
-  // Захист від SQL injection: беремо лише з білого списку
+  // Анти-SQLi: беремо лише з білого списку
   const col = ORDERABLE[sort_col] || ORDERABLE[DEFAULT_SORT_COL];
   const dir = sort_order === 'desc' ? 'DESC' : 'ASC';
   return `ORDER BY ${col} ${dir}, id ASC`; // другорядне стабілізуюче сортування
@@ -99,7 +95,7 @@ exports.handler = async (event) => {
   }
 
   try {
-    // 1) Дістаємо user_id (якщо є)
+    // 1) Поточний користувач (якщо є)
     let userId = null;
     try {
       userId = await getUserIdFromCookie(event);
@@ -107,21 +103,21 @@ exports.handler = async (event) => {
       userId = null;
     }
 
-    // 2) Визначаємо сортування
-    let sort_col  = DEFAULT_SORT_COL;
+    // 2) Обрати сортування
+    let sort_col   = DEFAULT_SORT_COL;
     let sort_order = DEFAULT_SORT_DIR;
 
     if (userId) {
       const prefs = await getUserSortPrefs(userId);
       if (prefs && ORDERABLE[prefs.sort_col] && (prefs.sort_order === 'asc' || prefs.sort_order === 'desc')) {
-        sort_col = prefs.sort_col;
+        sort_col   = prefs.sort_col;
         sort_order = prefs.sort_order;
       }
     }
 
     const orderBy = buildOrderBy(sort_col, sort_order);
 
-    // 3) Тягнемо матчі. Мінімізуємо припущення щодо схеми: витягуємо ключові колонки + id.
+    // 3) Витягнути матчі
     const sql = `
       SELECT id, kickoff_at, league, status, home_team, away_team, tournament, rank, link
         FROM matches
