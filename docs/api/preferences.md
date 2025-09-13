@@ -82,4 +82,40 @@ curl -i -sS "$FN/preferences" -X POST \
 500 server_error
 
 
+---
+
+## Взаємодія з `/getMatches` та пагінація
+
+Ендпоїнт `GET /.netlify/functions/getMatches` застосовує збережені префи:
+- `sort_col`: `league` або `kickoff_at`
+- `sort_order`: `asc` або `desc`
+- Для анонімів дефолт: `{"sort_col":"kickoff_at","sort_order":"asc","seen_color":"#ffffcc"}`.
+- Поля пагінації (`page.limit`, `page.offset`, `page.next_offset`, `page.has_more`) формуються **після** сортування.
+
+### Приклад (авторизований сценарій)
+```bash
+# 1) /me → отримати CSRF
+curl -sS "https://<origin>/.netlify/functions/me" \
+  -H "Origin: https://<origin>" \
+  --cookie "session=<sid>.<sig>"
+
+# 2) Встановити префи: сортування за лігою (спадання)
+echo '{"sort_col":"league","sort_order":"desc"}' > prefs.json
+curl -i -sS "https://<origin>/.netlify/functions/preferences" -X POST \
+  -H "Origin: https://<origin>" \
+  -H "Content-Type: application/json; charset=utf-8" \
+  -H "X-CSRF: <csrf>" \
+  --cookie "session=<sid>.<sig>" \
+  --data-binary "@prefs.json"
+
+# 3) Пагінація (limit=5)
+curl -i -sS "https://<origin>/.netlify/functions/getMatches?limit=5&offset=0" \
+  -H "Origin: https://<origin>" --cookie "session=<sid>.<sig>"
+curl -i -sS "https://<origin>/.netlify/functions/getMatches?limit=5&offset=5" \
+  -H "Origin: https://<origin>" --cookie "session=<sid>.<sig>"
+
+# 4) Очікування у відповіді getMatches:
+"prefs": { "sort_col": "league", "sort_order": "desc", "seen_color": "..." },
+"page":  { "limit": 5, "offset": 0, "next_offset": 5, "has_more": true }
+
 
