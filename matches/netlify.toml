@@ -1,8 +1,0 @@
-[build]
-  publish = "public"
-  functions = "functions"
-
-# Enable later if you want scheduled syncs:
-# [[scheduled.functions]]
-#   function = "update-matches"
-#   cron = "0 3 * * *"   # daily at 03:00 UTC

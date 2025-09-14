@@ -1,8 +1,8 @@
-﻿# Ignore all top-level project folders (each is its own repo)
-*/
+﻿# Meta-repo: ignore everything by default
+/*
 
-# Allow meta files/folders
-!.github/
-!README.md
-!development.code-workspace
-!.gitignore
+# Allow these meta files/folders in the root of this repo
+!/.gitignore
+!/README.md
+!/development.code-workspace
+!/.github/        # (only if you want org-wide templates here)
