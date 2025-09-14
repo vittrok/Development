@@ -1,0 +1,8 @@
+﻿# Ignore all top-level project folders (each is its own repo)
+*/
+
+# Allow meta files/folders
+!.github/
+!README.md
+!development.code-workspace
+!.gitignore
